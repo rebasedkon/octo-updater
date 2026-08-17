@@ -10,7 +10,7 @@ import os
 import sys
 import ssl
 import urllib.request
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 import shutil
 import stat
 import struct
@@ -26,12 +26,13 @@ from pathlib import Path
 #  Constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-UPDATER_VERSION  = "1.2"
+UPDATER_VERSION  = "1.3.2"
 SERVER           = "https://octowow.st"
-DOWNLOAD_VERSION = "latest"
+TORRENT_URL      = "https://dl.octowow.st/download/client.torrent"
 UA               = f"OctoUpdater/{UPDATER_VERSION}"
 DOWNLOAD_RETRY   = 5
 DOWNLOAD_TIMEOUT = 10    # seconds without any data before a transfer aborts
+TORRENT_MAX_SIZE = 4 * 1024 * 1024
 
 # Where the app keeps its files: next to the .exe when frozen (PyInstaller),
 # otherwise next to this script — never the current working directory, which
@@ -116,6 +117,7 @@ except (AttributeError, ValueError):
 # redirecting a download (e.g. a mod DLL) to an unexpected host.
 ALLOWED_DOWNLOAD_HOSTS = {
     "octowow.st",
+    "dl.octowow.st",
     "github.com",
     "objects.githubusercontent.com",
     "release-assets.githubusercontent.com",
@@ -257,6 +259,24 @@ def get_client_version(out_dir: str) -> str:
         return ""
 
 
+def is_wow_running() -> bool:
+    """Return whether Windows currently has a WoW.exe process."""
+    if os.name != "nt":
+        return False
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq WoW.exe", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            timeout=5)
+        return '"wow.exe"' in result.stdout.lower()
+    except Exception:
+        # A failed process probe must not make the launcher unusable. The
+        # atomic replace still provides a precise file-in-use error later.
+        return False
+
+
 def fmt_size(num_bytes: float) -> str:
     """Human-readable size: KB under a megabyte, MB otherwise."""
     if num_bytes < 1024 * 1024:
@@ -296,26 +316,418 @@ def save_cache(cache: dict):
     except Exception as e:
         sys.stderr.write(f"[cache] failed to write {CACHE_FILE}: {e}\n")
 
-def cached_sha1(path_str: str, cache: dict) -> str:
-    try:
-        mtime = os.path.getmtime(path_str)
-        entry = cache.get(path_str)
-        if entry and entry[1] == mtime:
-            return entry[0]
-        h = sha1_file(path_str)
-        cache[path_str] = [h, mtime]
-        return h
-    except Exception:
-        return ""
+# ── HTTPS web-seed updater ─────────────────────────────────────────────────────────────
+# OctoWoW retired its JSON manifest in favour of a .torrent.  We use that
+# file only as authenticated-over-HTTPS metadata: no peer connections, DHT,
+# listening socket, upload, or seeding is implemented.  BEP 19 web-seed URLs
+# let us continue fetching individual changed files over ordinary HTTPS.
 
 
-def already_updated(dest, expected_hash) -> bool:
-    if not os.path.exists(dest):
-        return False
+def _bdecode(data: bytes):
+    """Small strict bencode decoder for trusted-size metainfo documents."""
+    pos = 0
+
+    def parse(depth=0):
+        nonlocal pos
+        if depth > 64 or pos >= len(data):
+            raise ValueError("Invalid torrent metadata")
+        ch = data[pos]
+        if ch == ord("i"):
+            end = data.find(b"e", pos + 1)
+            if end < 0:
+                raise ValueError("Unterminated torrent integer")
+            raw = data[pos + 1:end]
+            if not raw or (raw.startswith(b"-") and len(raw) == 1):
+                raise ValueError("Invalid torrent integer")
+            pos = end + 1
+            return int(raw)
+        if ch == ord("l"):
+            pos += 1
+            out = []
+            while pos < len(data) and data[pos] != ord("e"):
+                out.append(parse(depth + 1))
+            if pos >= len(data):
+                raise ValueError("Unterminated torrent list")
+            pos += 1
+            return out
+        if ch == ord("d"):
+            pos += 1
+            out = {}
+            while pos < len(data) and data[pos] != ord("e"):
+                key = parse(depth + 1)
+                if not isinstance(key, bytes):
+                    raise ValueError("Torrent dictionary key is not bytes")
+                out[key] = parse(depth + 1)
+            if pos >= len(data):
+                raise ValueError("Unterminated torrent dictionary")
+            pos += 1
+            return out
+        colon = data.find(b":", pos)
+        if colon < 0:
+            raise ValueError("Invalid torrent byte string")
+        raw_len = data[pos:colon]
+        if not raw_len or not raw_len.isdigit():
+            raise ValueError("Invalid torrent byte-string length")
+        size = int(raw_len)
+        pos = colon + 1
+        end = pos + size
+        if end > len(data):
+            raise ValueError("Truncated torrent byte string")
+        value = data[pos:end]
+        pos = end
+        return value
+
+    value = parse()
+    if pos != len(data):
+        raise ValueError("Trailing data in torrent metadata")
+    return value
+
+
+def _torrent_text(value, label: str) -> str:
+    if not isinstance(value, bytes):
+        raise ValueError(f"Invalid torrent {label}")
     try:
-        return sha1_file(dest) == expected_hash
-    except Exception:
-        return False
+        return value.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ValueError(f"Torrent {label} is not UTF-8") from e
+
+
+class TorrentMetadata:
+    def __init__(self, raw: bytes):
+        doc = _bdecode(raw)
+        if not isinstance(doc, dict) or not isinstance(doc.get(b"info"), dict):
+            raise ValueError("Torrent has no info dictionary")
+        info = doc[b"info"]
+        self.metainfo_sha1 = hashlib.sha1(raw).hexdigest()
+        self.name = _torrent_text(info.get(b"name"), "name")
+        if self.name in ("", ".", "..") or "/" in self.name or "\\" in self.name:
+            raise ValueError("Unsafe torrent root name")
+        self.piece_length = info.get(b"piece length")
+        pieces = info.get(b"pieces")
+        if (not isinstance(self.piece_length, int) or self.piece_length <= 0
+                or not isinstance(pieces, bytes) or not pieces
+                or len(pieces) % 20):
+            raise ValueError("Invalid torrent piece table")
+        self.pieces = [pieces[i:i + 20] for i in range(0, len(pieces), 20)]
+
+        url_list = doc.get(b"url-list", [])
+        if isinstance(url_list, bytes):
+            url_list = [url_list]
+        if not isinstance(url_list, list):
+            raise ValueError("Invalid torrent web-seed list")
+        self.web_seeds = []
+        for item in url_list:
+            url = _torrent_text(item, "web-seed URL")
+            _check_url(url, ALLOWED_DOWNLOAD_HOSTS)
+            parsed_url = urlsplit(url)
+            if parsed_url.username or parsed_url.password or parsed_url.query \
+                    or parsed_url.fragment:
+                raise ValueError("Unsafe torrent web-seed URL")
+            self.web_seeds.append(url)
+        if not self.web_seeds:
+            raise ValueError("Torrent contains no HTTPS web seed")
+
+        source_files = info.get(b"files")
+        if not isinstance(source_files, list) or not source_files:
+            raise ValueError("Torrent is not a multi-file client package")
+        self.files = []
+        seen_paths = set()
+        offset = 0
+        for entry in source_files:
+            if not isinstance(entry, dict) or not isinstance(entry.get(b"length"), int):
+                raise ValueError("Invalid torrent file entry")
+            length = entry[b"length"]
+            parts_raw = entry.get(b"path")
+            if length < 0 or not isinstance(parts_raw, list) or not parts_raw:
+                raise ValueError("Invalid torrent file path")
+            parts = tuple(_torrent_text(p, "path") for p in parts_raw)
+            if any(p in ("", ".", "..") or "/" in p or "\\" in p
+                   or ":" in p or p[-1:] in (" ", ".") for p in parts):
+                raise ValueError("Unsafe path in torrent metadata")
+            first_piece = offset // self.piece_length
+            last_piece = ((offset + length - 1) // self.piece_length
+                          if length else first_piece)
+            sig = hashlib.sha256()
+            sig.update(str(length).encode("ascii") + b":")
+            sig.update(str(offset % self.piece_length).encode("ascii") + b":")
+            for piece_hash in self.pieces[first_piece:last_piece + 1]:
+                sig.update(piece_hash)
+            rel = "/".join(parts)
+            key = rel.lower()
+            if key in seen_paths:
+                raise ValueError("Duplicate path in torrent metadata")
+            seen_paths.add(key)
+            self.files.append({
+                "parts": parts, "rel": rel, "key": key,
+                "length": length, "offset": offset,
+                "first_piece": first_piece, "last_piece": last_piece,
+                "signature": sig.hexdigest(),
+            })
+            offset += length
+        self.total_length = offset
+        expected_pieces = ((offset + self.piece_length - 1) // self.piece_length)
+        if expected_pieces != len(self.pieces):
+            raise ValueError("Torrent piece count does not match its files")
+        self.by_key = {f["key"]: f for f in self.files}
+
+    def file_url(self, file_rec: dict, web_seed: str | None = None) -> str:
+        base = web_seed or self.web_seeds[0]
+        # BEP 19 multi-file mapping: <url-list>/<torrent-name>/<file-path>.
+        return (base.rstrip("/") + "/" + quote(self.name, safe="") + "/"
+                + "/".join(quote(p, safe="") for p in file_rec["parts"]))
+
+    def files_for_piece(self, piece_index: int) -> list:
+        start = piece_index * self.piece_length
+        end = min(start + self.piece_length, self.total_length)
+        return [f for f in self.files
+                if f["offset"] < end and f["offset"] + f["length"] > start]
+
+
+def fetch_torrent_metadata() -> TorrentMetadata:
+    req = urllib.request.Request(TORRENT_URL, headers={"User-Agent": UA})
+    with secure_urlopen(req, timeout=DOWNLOAD_TIMEOUT,
+                        allowed_hosts=ALLOWED_DOWNLOAD_HOSTS) as response:
+        size_header = response.headers.get("Content-Length")
+        if size_header and int(size_header) > TORRENT_MAX_SIZE:
+            raise RuntimeError("Torrent metadata is unexpectedly large")
+        raw = response.read(TORRENT_MAX_SIZE + 1)
+    if len(raw) > TORRENT_MAX_SIZE:
+        raise RuntimeError("Torrent metadata is unexpectedly large")
+    return TorrentMetadata(raw)
+
+
+def _torrent_owned_paths() -> set:
+    """Files controlled by this updater's mod toggles, not by client sync."""
+    paths = {"d3d9.dll", "dxvk.conf", "dlls.txt"}
+    for mod in globals().get("MODS_REGISTRY", []):
+        paths.update(str(p).replace("\\", "/").lower()
+                     for p in mod.get("installed_files", []))
+    return paths
+
+
+def _torrent_state() -> dict:
+    state = load_config().get("torrent_state", {})
+    return state if isinstance(state, dict) else {}
+
+
+def _save_torrent_state(meta: TorrentMetadata):
+    state = {
+        "metainfo_sha1": meta.metainfo_sha1,
+        "files": {f["key"]: f["signature"] for f in meta.files},
+        "layout": {f["key"]: [f["offset"], f["length"]] for f in meta.files},
+        "pieces": [p.hex() for p in meta.pieces],
+    }
+    update_config(lambda c: c.__setitem__("torrent_state", state))
+
+
+class _TorrentDiskReader:
+    """Sequentially reads the torrent's virtual concatenated file stream."""
+    def __init__(self, meta: TorrentMetadata, root: str):
+        self.meta, self.root = meta, root
+        self.file_index = 0
+        self.file_offset = 0
+        self.handle = None
+
+    def close(self):
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+
+    def _advance(self):
+        self.close()
+        self.file_index += 1
+        self.file_offset = 0
+
+    def consume(self, length: int, collect: bool) -> bytes | None:
+        chunks = []
+        valid = True
+        left = length
+        while left and self.file_index < len(self.meta.files):
+            rec = self.meta.files[self.file_index]
+            available = rec["length"] - self.file_offset
+            take = min(left, available)
+            if take:
+                if collect:
+                    try:
+                        if self.handle is None:
+                            path = os.path.join(self.root, *rec["parts"])
+                            self.handle = open(path, "rb")
+                            self.handle.seek(self.file_offset)
+                        chunk = self.handle.read(take)
+                        if len(chunk) != take:
+                            valid = False
+                        chunks.append(chunk)
+                    except OSError:
+                        valid = False
+                elif self.handle is not None:
+                    # A later selected piece in the same file must reopen at
+                    # the updated virtual offset, not at the old OS position.
+                    self.close()
+                self.file_offset += take
+                left -= take
+            if self.file_offset >= rec["length"]:
+                self._advance()
+        if left:
+            valid = False
+        return b"".join(chunks) if collect and valid else (None if collect else b"")
+
+
+def verify_torrent_files(meta: TorrentMetadata, root: str, excluded: set,
+                         cancel_fn, progress_fn) -> list:
+    """Full local piece check. Pieces touching mod-owned files are skipped."""
+    stale = set()
+    for rec in meta.files:
+        if rec["key"] in excluded:
+            continue
+        path = os.path.join(root, *rec["parts"])
+        try:
+            if os.path.getsize(path) != rec["length"]:
+                stale.add(rec["key"])
+        except OSError:
+            stale.add(rec["key"])
+
+    reader = _TorrentDiskReader(meta, root)
+    try:
+        for index, expected in enumerate(meta.pieces):
+            if cancel_fn():
+                raise RuntimeError("Cancelled")
+            touched = meta.files_for_piece(index)
+            skip = any(f["key"] in excluded or f["key"] in stale for f in touched)
+            piece_size = min(meta.piece_length,
+                             meta.total_length - index * meta.piece_length)
+            data = reader.consume(piece_size, not skip)
+            if not skip and (data is None or hashlib.sha1(data).digest() != expected):
+                stale.update(f["key"] for f in touched if f["key"] not in excluded)
+            if index % 32 == 0 or index + 1 == len(meta.pieces):
+                progress_fn((index + 1) / len(meta.pieces))
+    finally:
+        reader.close()
+    return [f for f in meta.files if f["key"] in stale]
+
+
+def quick_torrent_diff(meta: TorrentMetadata, root: str, excluded: set) -> list:
+    """Size-check local files and use prior piece signatures for server deltas."""
+    previous = _torrent_state().get("files", {})
+    expected_patched_wow = load_config().get("expected_patched_wow_hash", "")
+    if not isinstance(previous, dict):
+        previous = {}
+    stale = []
+    for rec in meta.files:
+        if rec["key"] in excluded:
+            continue
+        path = os.path.join(root, *rec["parts"])
+        try:
+            wrong_size = os.path.getsize(path) != rec["length"]
+        except OSError:
+            wrong_size = True
+        if (not wrong_size and rec["key"] == "wow.exe"
+                and expected_patched_wow):
+            wrong_size = sha1_file(path) != expected_patched_wow
+        changed_upstream = bool(previous) and previous.get(rec["key"]) != rec["signature"]
+        if wrong_size or changed_upstream:
+            stale.append(rec)
+    return stale
+
+
+def torrent_download_plan(meta: TorrentMetadata, root: str,
+                          requested: set, excluded: set) -> tuple:
+    """Split an update into whole files and changed pieces.
+
+    Piece patching is safe only when the file kept the same virtual offset and
+    length as the previously accepted torrent. Missing/resized/rearranged files
+    fall back to an ordinary whole-file HTTPS download.
+    """
+    state = _torrent_state()
+    old_layout = state.get("layout", {})
+    old_piece_hex = state.get("pieces", [])
+    if not isinstance(old_layout, dict) or not isinstance(old_piece_hex, list):
+        old_layout, old_piece_hex = {}, []
+    try:
+        old_pieces = [bytes.fromhex(p) for p in old_piece_hex]
+        if any(len(p) != 20 for p in old_pieces):
+            old_pieces = []
+    except (TypeError, ValueError):
+        old_pieces = []
+
+    full_files = []
+    changed_pieces = set()
+    for rec in meta.files:
+        if rec["key"] not in requested or rec["key"] in excluded:
+            continue
+        path = os.path.join(root, *rec["parts"])
+        try:
+            right_size = os.path.getsize(path) == rec["length"]
+        except OSError:
+            right_size = False
+        same_layout = old_layout.get(rec["key"]) == [rec["offset"], rec["length"]]
+        if not right_size or not same_layout or not old_pieces:
+            full_files.append(rec)
+            continue
+        rec_changed = []
+        for index in range(rec["first_piece"], rec["last_piece"] + 1):
+            if index >= len(old_pieces) or old_pieces[index] != meta.pieces[index]:
+                rec_changed.append(index)
+        if rec_changed:
+            changed_pieces.update(rec_changed)
+        else:
+            # Requested by a full integrity check rather than an upstream
+            # metadata delta; without a known bad-piece index, repair it whole.
+            full_files.append(rec)
+    return full_files, changed_pieces
+
+
+def verify_torrent_piece_subset(meta: TorrentMetadata, root: str,
+                                piece_indexes: set, excluded: set,
+                                cancel_fn, progress_fn) -> set:
+    """Verify selected pieces after downloads; skip boundaries containing mods."""
+    eligible = {i for i in piece_indexes
+                if not any(f["key"] in excluded for f in meta.files_for_piece(i))}
+    failed = set()
+    reader = _TorrentDiskReader(meta, root)
+    done = 0
+    try:
+        for index, expected in enumerate(meta.pieces):
+            if cancel_fn():
+                raise RuntimeError("Cancelled")
+            piece_size = min(meta.piece_length,
+                             meta.total_length - index * meta.piece_length)
+            wanted = index in eligible
+            data = reader.consume(piece_size, wanted)
+            if wanted:
+                done += 1
+                if data is None or hashlib.sha1(data).digest() != expected:
+                    failed.add(index)
+                progress_fn(done / max(1, len(eligible)))
+    finally:
+        reader.close()
+    return failed
+
+
+_LEGACY_ARCHIVES = {
+    "patch-6.mpq": 451195806,
+    "patch-7.mpq": 175256564,
+    "patch-8.mpq": 484649870,
+    "patch-9.mpq": 506808141,
+    "patch-a.mpq": 241751337,
+}
+
+
+def prune_legacy_client_files(meta: TorrentMetadata, root: str):
+    """Mirror the official launcher's conservative stale-archive cleanup."""
+    expected = {os.path.basename(f["rel"]).lower() for f in meta.files
+                if f["rel"].lower().startswith("data/")
+                and f["rel"].lower().endswith(".mpq")}
+    data_dir = os.path.join(root, "Data")
+    for name, old_size in _LEGACY_ARCHIVES.items():
+        if name in expected:
+            continue
+        path = os.path.join(data_dir, name)
+        try:
+            if os.path.getsize(path) == old_size:
+                os.remove(path)
+                log(f"Removed obsolete client archive: Data/{name}", "dim")
+        except OSError:
+            pass
 
 
 class VerifyWorker:
@@ -341,61 +753,29 @@ class VerifyWorker:
     def progress(self, value, label=""):
         self.prog_q.put((value, label))
 
-    def _file_ok(self, dest, server_hash, name):
-        if not os.path.exists(dest):
-            return False
-        local_hash = cached_sha1(dest, self._cache)
-        if local_hash == server_hash:
-            return True
-        if name == "WoW.exe" and self.expected_patched_wow_hash:
-            return (local_hash == self.expected_patched_wow_hash
-                    and server_hash == self.original_server_wow_hash)
-        return False
-
-    def _traverse(self, node, path_parts):
-        if self._cancel:
-            return None
-        t    = node["type"]
-        name = node["name"]
-        cur  = path_parts + [name]
-
-        if t == "dir":
-            stale = [c for child in node.get("files", [])
-                     if (c := self._traverse(child, cur)) is not None]
-            return {**node, "files": stale} if stale else None
-
-        dest = os.path.join(self.out_dir, os.path.join(*cur))
-
-        if t == "del":
-            return node if os.path.exists(dest) else None
-
-        if t == "file":
-            return None if self._file_ok(dest, node["hash"], name) else node
-
-        if t == "mpq":
-            mpq_dest = os.path.join(self.out_dir, os.path.join(*(path_parts + [name + ".mpq"])))
-            return None if self._file_ok(mpq_dest, node["hash"], name + ".mpq") else node
-
-        return None
-
     def run(self):
         try:
-            self.progress(0.02, "Fetching manifest...")
-            self.log("Verifying files...", "acct")
-            req = urllib.request.Request(
-                f"{SERVER}/api/file/{DOWNLOAD_VERSION}/manifest.json",
-                headers={"User-Agent": UA})
-            with secure_urlopen(req, timeout=DOWNLOAD_TIMEOUT) as r:
-                manifest = json.load(r)
-            self.progress(0.5, "Checking...")
-
-            stale_nodes = [c for child in manifest["root"].get("files", [])
-                           if (c := self._traverse(child, [])) is not None]
+            self.progress(0.02, "Fetching update metadata...")
+            self.log("Fetching client.torrent metadata...", "acct")
+            meta = fetch_torrent_metadata()
+            self.log(f"Metadata received ({len(meta.files)} files).", "ok")
+            excluded = _torrent_owned_paths()
+            state = _torrent_state()
+            if state.get("files"):
+                self.progress(0.45, "Checking files...")
+                stale_nodes = quick_torrent_diff(meta, self.out_dir, excluded)
+            else:
+                self.log("Performing first full local integrity check...", "dim")
+                stale_nodes = verify_torrent_files(
+                    meta, self.out_dir, excluded,
+                    lambda: self._cancel,
+                    lambda p: self.progress(0.08 + p * 0.84,
+                                            f"Verifying... {int(p * 100)}%"))
 
             self.progress(1.0, "")
             save_cache(self._cache)
 
-            # Config.wtf isn't part of the manifest — it's user game config.
+            # Config.wtf isn't part of client sync — it's user game config.
             # Create it when missing, or overwrite it when the user
             # committed to this folder.
             cfg_wtf = os.path.join(self.out_dir, "WTF", "Config.wtf")
@@ -403,10 +783,14 @@ class VerifyWorker:
                 write_config_wtf(self.out_dir)
 
             if stale_nodes:
-                self.log("Update available.", "acct")
+                total = sum(n["length"] for n in stale_nodes)
+                self.log(f"Update available: {len(stale_nodes)} file(s), "
+                         f"{fmt_size(total)}.", "acct")
                 self.log_q.put(("__UPDATE_NEEDED__", ""))
-                self.log_q.put(("__DIFF_TREE__", stale_nodes))
+                self.log_q.put(("__DIFF_TREE__",
+                                [n["key"] for n in stale_nodes]))
             else:
+                _save_torrent_state(meta)
                 self.log("Everything is up to date!", "ok")
                 self.log_q.put(("__UP_TO_DATE__", ""))
         except Exception as e:
@@ -447,9 +831,19 @@ class UpdateWorker:
             try:
                 # Resume a previous partial download when one is present.
                 got = os.path.getsize(tmp) if os.path.exists(tmp) else 0
-                if size and got >= size:
+                if size and got > size:
                     os.remove(tmp)   # oversized/stale leftover — start clean
                     got = 0
+
+                if size and got == size:
+                    self.log("  Finalizing completed temporary download…", "dim")
+                    digest = sha1_file(tmp)
+                    os.replace(tmp, dest)
+                    try:
+                        self._cache[dest] = [digest, os.path.getmtime(dest)]
+                    except OSError:
+                        self._cache.pop(dest, None)
+                    return digest
 
                 headers = {"User-Agent": UA}
                 mode    = "wb"
@@ -507,7 +901,7 @@ class UpdateWorker:
                     raise IOError("connection lost at "
                                   f"{fmt_size(downloaded)} / {total_str}")
 
-                shutil.move(tmp, dest)
+                os.replace(tmp, dest)
                 if hasher is not None:
                     digest = hasher.hexdigest().upper()
                     try:
@@ -522,6 +916,11 @@ class UpdateWorker:
             except Exception as e:
                 if self._cancel:
                     raise RuntimeError("Cancelled")
+                if getattr(e, "winerror", None) == 32:
+                    raise RuntimeError(
+                        f"Cannot replace {name} because it is in use. "
+                        "Close WoW and any other launcher, then try again. "
+                        "The completed download has been kept.") from e
                 # Keep tmp — the next attempt resumes from where this one
                 # stopped instead of redownloading from zero.
                 self.log(f"  Attempt {attempt} failed: {e}", "err")
@@ -535,69 +934,59 @@ class UpdateWorker:
                     time.sleep(wait)
         raise RuntimeError(f"Download failed after {DOWNLOAD_RETRY} attempts: {url}")
 
-    def traverse(self, node, path_parts):
-        if self._cancel:
-            return
-        t    = node["type"]
-        name = node["name"]
-        cur  = path_parts + [name]
+    def _download_range(self, url: str, start: int, length: int) -> bytes:
+        headers = {
+            "User-Agent": UA,
+            "Range": f"bytes={start}-{start + length - 1}",
+        }
+        req = urllib.request.Request(url, headers=headers)
+        with secure_urlopen(req, timeout=DOWNLOAD_TIMEOUT,
+                            allowed_hosts=ALLOWED_DOWNLOAD_HOSTS) as response:
+            status = getattr(response, "status", None) or response.getcode()
+            data = response.read(length + 1)
+        if status not in (200, 206) or len(data) != length:
+            raise IOError(f"Invalid HTTP range response ({status}, {len(data)} bytes)")
+        return data
 
-        rel  = os.path.join(*cur)
-        dest = os.path.join(self.out_dir, rel)
-
-        if t == "dir":
-            for child in node.get("files", []):
-                self.traverse(child, cur)
-
-        elif t == "file":
-            self.log(f"[file] {rel}", "acct")
-            url = f"{SERVER}/client/{DOWNLOAD_VERSION}/{'/'.join(cur)}"
-
-            if name == "WoW.exe" and self.expected_patched_wow_hash:
-                server_hash = node["hash"]
-                original_server_hash = self.original_server_wow_hash
-                local_hash = sha1_file(dest) if os.path.exists(dest) else ""
-                already_patched = (
-                    local_hash == self.expected_patched_wow_hash
-                    and server_hash == original_server_hash
-                )
-                if already_patched:
-                    self.log("  Already up to date (patched).", "dim")
-                    return
-            elif already_updated(dest, node["hash"]):
-                self.log("  Already up to date.", "dim")
-                return
-
-            got_hash = self.download(url, dest, node["size"], rel)
-            if (got_hash or sha1_file(dest)) != node["hash"]:
-                self.log("  Hash mismatch — retrying", "err")
-                os.remove(dest)
-                got_hash = self.download(url, dest, node["size"], rel)
-                if (got_hash or sha1_file(dest)) != node["hash"]:
-                    raise RuntimeError(f"Hash mismatch after redownload: {rel}")
-
-        elif t == "mpq":
-            mpq_name = name + ".mpq"
-            cur_mpq  = path_parts + [mpq_name]
-            rel      = os.path.join(*cur_mpq)
-            dest     = os.path.join(self.out_dir, rel)
-            url      = f"{SERVER}/client/{DOWNLOAD_VERSION}/{'/'.join(cur_mpq)}"
-            self.log(f"[mpq]  {rel}", "acct")
-            if already_updated(dest, node["hash"]):
-                self.log("  Already up to date.", "dim")
-                return
-            got_hash = self.download(url, dest, node["size"], rel)
-            if (got_hash or sha1_file(dest)) != node["hash"]:
-                self.log("  Hash mismatch — retrying", "err")
-                os.remove(dest)
-                got_hash = self.download(url, dest, node["size"], rel)
-                if (got_hash or sha1_file(dest)) != node["hash"]:
-                    raise RuntimeError(f"Hash mismatch after redownload: {rel}")
-
-        elif t == "del":
-            self.log(f"[del]  {rel}", "dim")
-            if os.path.exists(dest):
-                os.remove(dest)
+    def patch_torrent_piece(self, meta: TorrentMetadata, piece_index: int,
+                            writable_keys: set, excluded: set) -> int:
+        """Fetch, hash, then apply one complete piece through file ranges."""
+        piece_start = piece_index * meta.piece_length
+        piece_end = min(piece_start + meta.piece_length, meta.total_length)
+        last_error = None
+        for attempt in range(1, DOWNLOAD_RETRY + 1):
+            if self._cancel:
+                raise RuntimeError("Cancelled")
+            try:
+                blocks = []
+                for rec in meta.files_for_piece(piece_index):
+                    start = max(piece_start, rec["offset"])
+                    end = min(piece_end, rec["offset"] + rec["length"])
+                    rel_start = start - rec["offset"]
+                    data = self._download_range(
+                        meta.file_url(rec), rel_start, end - start)
+                    blocks.append((rec, rel_start, data))
+                piece_data = b"".join(data for _rec, _start, data in blocks)
+                if hashlib.sha1(piece_data).digest() != meta.pieces[piece_index]:
+                    raise IOError("torrent piece hash mismatch")
+                # Nothing touches disk until the complete server piece passes
+                # its hash, keeping interrupted retries deterministic.
+                for rec, rel_start, data in blocks:
+                    if rec["key"] in excluded or rec["key"] not in writable_keys:
+                        continue
+                    dest = os.path.join(self.out_dir, *rec["parts"])
+                    with open(dest, "r+b") as handle:
+                        handle.seek(rel_start)
+                        handle.write(data)
+                return len(piece_data)
+            except Exception as e:
+                last_error = e
+                if attempt < DOWNLOAD_RETRY:
+                    self.log(f"  Piece {piece_index + 1} attempt {attempt} "
+                             f"failed: {e}", "err")
+                    time.sleep(min(2 ** attempt, 10))
+        raise RuntimeError(
+            f"Could not download torrent piece {piece_index + 1}: {last_error}")
 
     def build_tweaks(self, buf, tweaks: dict | None = None):
         if tweaks is None:
@@ -627,10 +1016,6 @@ class UpdateWorker:
             ("alwaysAutoLoot", "bytes", None, [
                 (0x0c1ecf, bytes([0x75 if always_loot else 0x74])),
                 (0x0c2b25, bytes([0x75 if always_loot else 0x74])),
-            ]),
-            ("crossFactionResurrect", "bytes", None, [
-                (0x006e5fb8, bytes([0x006e5fb9 & 0xff])),
-                (0x006e62a8, bytes([0x006e62a9 & 0xff])),
             ]),
             ("cameraSkipFix", "bytes", None, [
                 (0x02ccd0, bytes([
@@ -689,6 +1074,10 @@ class UpdateWorker:
                 struct.pack_into("<H",  buf, offset, value)
             elif kind == "bytes":
                 for off, data in value:
+                    if off < 0 or off + len(data) > len(buf):
+                        raise RuntimeError(
+                            f"Refusing out-of-bounds {label} patch at "
+                            f"0x{off:x} for a {len(buf)}-byte WoW.exe")
                     buf[off: off + len(data)] = data
         with open(exe, "wb") as f:
             f.write(buf)
@@ -697,38 +1086,117 @@ class UpdateWorker:
         patched_hash = sha1_file(exe)
         self.log_q.put((f"__PATCHED_HASH__{patched_hash}", ""))
 
-    @staticmethod
-    def _nodes_contain_wow_exe(nodes) -> bool:
-        if nodes is None:
-            return True
-        for node in nodes:
-            if node.get("type") == "file" and node.get("name") == "WoW.exe":
-                return True
-            if node.get("type") == "dir":
-                if UpdateWorker._nodes_contain_wow_exe(node.get("files", [])):
-                    return True
-        return False
-
     def run(self, diff_nodes=None):
         try:
-            if diff_nodes is not None:
-                self.log("\nStarting client update…\n")
-                self.progress(0.05, "Downloading…")
-                for child in diff_nodes:
-                    self.traverse(child, [])
+            if is_wow_running():
+                raise RuntimeError(
+                    "WoW.exe is currently running. Close the game before updating.")
+            self.progress(0.02, "Fetching update metadata…")
+            self.log("Fetching client.torrent metadata…")
+            meta = fetch_torrent_metadata()
+            excluded = _torrent_owned_paths()
+            requested = {str(k).replace("\\", "/").lower()
+                         for k in (diff_nodes or [])}
+            requested.update(f["key"] for f in quick_torrent_diff(
+                meta, self.out_dir, excluded))
+            if not _torrent_state().get("files") and not requested:
+                requested.update(f["key"] for f in verify_torrent_files(
+                    meta, self.out_dir, excluded,
+                    lambda: self._cancel,
+                    lambda p: self.progress(0.03 + p * 0.20,
+                                            f"Verifying… {int(p * 100)}%")))
+            targets, patch_pieces = torrent_download_plan(
+                meta, self.out_dir, requested, excluded)
+            writable_keys = requested - excluded
+            downloaded_keys = {f["key"] for f in targets}
+            for index in patch_pieces:
+                downloaded_keys.update(
+                    f["key"] for f in meta.files_for_piece(index)
+                    if f["key"] in writable_keys)
+
+            self.log("\nStarting HTTPS web-seed update…\n")
+            self.log("Peer-to-peer networking and seeding are disabled.", "dim")
+            total_bytes = (sum(f["length"] for f in targets)
+                           + sum(min(meta.piece_length,
+                                     meta.total_length - i * meta.piece_length)
+                                 for i in patch_pieces))
+            if targets or patch_pieces:
+                detail = []
+                if targets:
+                    detail.append(f"{len(targets)} whole file(s)")
+                if patch_pieces:
+                    detail.append(f"{len(patch_pieces)} changed piece(s)")
+                self.log(f"Downloading {fmt_size(total_bytes)} via HTTPS "
+                         f"({', '.join(detail)}).", "acct")
             else:
-                self.progress(0.02, "Fetching manifest…")
-                self.log("Fetching manifest.json…")
-                req = urllib.request.Request(
-                    f"{SERVER}/api/file/{DOWNLOAD_VERSION}/manifest.json",
-                    headers={"User-Agent": UA})
-                with secure_urlopen(req, timeout=DOWNLOAD_TIMEOUT) as r:
-                    manifest = json.load(r)
-                self.log("Manifest received.", "ok")
-                self.progress(0.05, "Downloading…")
-                self.log("\nStarting client update…\n")
-                for child in manifest["root"].get("files", []):
-                    self.traverse(child, [])
+                self.log("No client files need downloading.", "dim")
+
+            for rec in targets:
+                if self._cancel:
+                    raise RuntimeError("Cancelled")
+                rel = os.path.join(*rec["parts"])
+                self.log(f"[file] {rel}", "acct")
+                self.download(meta.file_url(rec),
+                              os.path.join(self.out_dir, *rec["parts"]),
+                              rec["length"], rel)
+
+            if patch_pieces:
+                self.log("Applying changed torrent pieces through HTTPS ranges…",
+                         "acct")
+                patched_bytes = 0
+                ordered_pieces = sorted(patch_pieces)
+                patch_total = sum(
+                    min(meta.piece_length,
+                        meta.total_length - i * meta.piece_length)
+                    for i in ordered_pieces)
+                for number, index in enumerate(ordered_pieces, 1):
+                    patched_bytes += self.patch_torrent_piece(
+                        meta, index, writable_keys, excluded)
+                    self.progress(
+                        number / len(ordered_pieces) * 0.85,
+                        f"Changed pieces   •   {fmt_size(patched_bytes)}"
+                        f" / {fmt_size(patch_total)}")
+
+            affected_pieces = set()
+            for rec in targets:
+                affected_pieces.update(range(rec["first_piece"],
+                                             rec["last_piece"] + 1))
+            affected_pieces.update(patch_pieces)
+            if affected_pieces:
+                self.progress(0.88, "Checking downloaded data…")
+                failed = verify_torrent_piece_subset(
+                    meta, self.out_dir, affected_pieces, excluded,
+                    lambda: self._cancel,
+                    lambda p: self.progress(0.88 + p * 0.06,
+                                            f"Checking download… {int(p * 100)}%"))
+                if failed:
+                    retry_keys = {
+                        f["key"] for i in failed for f in meta.files_for_piece(i)
+                        if f["key"] not in excluded
+                    }
+                    downloaded_keys.update(retry_keys)
+                    self.log("Torrent hash mismatch — redownloading affected files.",
+                             "err")
+                    for rec in meta.files:
+                        if rec["key"] not in retry_keys:
+                            continue
+                        dest = os.path.join(self.out_dir, *rec["parts"])
+                        try:
+                            os.remove(dest)
+                        except OSError:
+                            pass
+                        self.download(meta.file_url(rec), dest,
+                                      rec["length"], rec["rel"])
+                    retry_pieces = {
+                        i for rec in meta.files if rec["key"] in retry_keys
+                        for i in range(rec["first_piece"], rec["last_piece"] + 1)
+                    }
+                    failed = verify_torrent_piece_subset(
+                        meta, self.out_dir, retry_pieces, excluded,
+                        lambda: self._cancel, lambda _p: None)
+                    if failed:
+                        raise RuntimeError(
+                            "Downloaded files did not match the torrent hashes")
 
             if self._cancel:
                 self.log("\nUpdate cancelled.", "err")
@@ -738,8 +1206,9 @@ class UpdateWorker:
 
             self.log("\nDownload complete.", "ok")
             remove_wdb(self.out_dir)
+            prune_legacy_client_files(meta, self.out_dir)
 
-            wow_exe_updated = self._nodes_contain_wow_exe(diff_nodes)
+            wow_exe_updated = "wow.exe" in downloaded_keys
             if wow_exe_updated:
                 self.progress(0.92, "Patching…")
                 self.patch_exe()
@@ -752,6 +1221,7 @@ class UpdateWorker:
             # change; a regular update must never touch it.
             self.progress(1.0, "")
             save_cache(self._cache)
+            _save_torrent_state(meta)
             self.log("\n✓  Everything is up to date!", "ok")
             client_ver = get_client_version(self.out_dir)
             if client_ver:
@@ -2315,7 +2785,7 @@ class OctoUpdaterApp(tk.Tk):
         # current dir. If the user closes it without changing the folder or
         # adding a Defender exclusion, recommend the exclusion once on close.
         self._first_run_av_pending = self._first_run
-        # On first run we don't verify (fetch the manifest / touch Config.wtf)
+        # On first run we don't verify (fetch metadata / touch Config.wtf)
         # until the user closes Settings, so nothing is written to the default
         # folder before they've picked their real game folder. A folder change
         # supersedes this (it verifies the new folder right away).
@@ -4672,7 +5142,7 @@ class OctoUpdaterApp(tk.Tk):
         def _reset_for_new_folder(c):
             c["out_dir"] = new_val
             for k in ("expected_patched_wow_hash", "original_server_wow_hash",
-                      "mods", "addons"):
+                      "torrent_state", "mods", "addons"):
                 c.pop(k, None)
         self._cfg = update_config(_reset_for_new_folder)
 
@@ -5006,9 +5476,10 @@ class OctoUpdaterApp(tk.Tk):
             ok = False
             try:
                 req = urllib.request.Request(
-                    f"{SERVER}/api/file/{DOWNLOAD_VERSION}/manifest.json",
+                    TORRENT_URL,
                     headers={"User-Agent": UA})
-                with secure_urlopen(req, timeout=6):
+                with secure_urlopen(req, timeout=6,
+                                    allowed_hosts=ALLOWED_DOWNLOAD_HOSTS):
                     ok = True
             except Exception:
                 ok = False
@@ -5094,7 +5565,7 @@ class OctoUpdaterApp(tk.Tk):
 
     def _verify_game_files(self):
         """Full re-verification: drop the hash cache and the patched-exe
-        bookkeeping so every file is re-hashed against the manifest and
+        bookkeeping so every file is checked against the torrent pieces and
         WoW.exe gets re-downloaded and re-patched (tweaks reapplied). Unlike
         a game-folder change, installed mods are left alone."""
         if self._running:
@@ -5107,6 +5578,7 @@ class OctoUpdaterApp(tk.Tk):
         def _drop_hashes(c):
             c.pop("expected_patched_wow_hash", None)
             c.pop("original_server_wow_hash", None)
+            c.pop("torrent_state", None)
         self._cfg = update_config(_drop_hashes)
         self._diff_nodes = None
         self._client_ready = False

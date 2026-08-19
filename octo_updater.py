@@ -76,10 +76,9 @@ def _relocate_legacy_data():
             continue
         try:
             shutil.move(old, new)
-            sys.stderr.write(f"[data] moved {old_name} -> {new}\n")
             break
-        except OSError as e:
-            sys.stderr.write(f"[data] could not move {old_name}: {e}\n")
+        except OSError:
+            pass
 
 # News tab: the latest announcement (forum 2, full post) fills the left panel,
 # the patch-notes list (forum 4) fills the right.
@@ -216,8 +215,7 @@ def load_config() -> dict:
             return json.load(f)
     except FileNotFoundError:
         return {}
-    except Exception as e:
-        sys.stderr.write(f"[config] failed to read {CONFIG_FILE}: {e}\n")
+    except Exception:
         return {}
 
 
@@ -236,8 +234,8 @@ def save_config(data: dict):
     with _CONFIG_LOCK:
         try:
             _atomic_write(CONFIG_FILE, json.dumps(data, indent=2))
-        except Exception as e:
-            sys.stderr.write(f"[config] failed to write {CONFIG_FILE}: {e}\n")
+        except Exception:
+            pass
 
 
 def update_config(mutator):
@@ -490,6 +488,70 @@ def _torrent_skip(parts, ignore_speech: bool) -> bool:
     if _is_torrent_excluded(parts):
         return True
     return ignore_speech and bool(parts) and parts[-1].lower() == "speech.mpq"
+
+
+# Files the sync must not rewrite (mod-owned client-root files, plus a kept
+# custom speech.MPQ). Excluding them from --select-file stops aria2 fetching
+# them on their own, but a torrent piece can straddle a file boundary, so
+# repairing a selected neighbour re-downloads the shared piece and rewrites the
+# excluded file's bytes too. We move them aside (rename) for the sync and put
+# them back — instant and RAM-free, unlike copying a large speech.MPQ.
+_SHIELD_SUFFIX = ".octobak"
+
+
+def shield_protected_files(client_dir: str, files, ignore_speech: bool) -> list:
+    """Prepare each sync-protected file (see _torrent_skip) for the sync. An
+    existing one is moved aside via a same-dir rename; an absent one is recorded
+    with backup=None, because the sync must never create it (only the Mods tab
+    installs these) yet aria2 may write a partial stub for it through a shared
+    piece. Returns [(orig, backup_or_None)] for unshielding."""
+    shielded = []
+    for parts, _length in files:
+        if not _torrent_skip(parts, ignore_speech):
+            continue
+        p = os.path.join(client_dir, *parts)
+        if os.path.exists(p):
+            bak = p + _SHIELD_SUFFIX
+            try:
+                os.replace(p, bak)      # same-fs, instant; aria2 sees p missing
+                shielded.append((p, bak))
+            except OSError:
+                pass
+        else:
+            shielded.append((p, None))  # must stay absent afterwards
+    return shielded
+
+
+def unshield_protected_files(shielded) -> list:
+    """Move each shielded file back, or delete the stub the sync created for a
+    file that was absent before. Returns the basenames restored."""
+    restored = []
+    for p, bak in shielded:
+        if bak is None:
+            try:
+                os.remove(p)            # drop aria2's partial stub; stay absent
+            except OSError:
+                pass
+            continue
+        try:
+            os.replace(bak, p)          # our version wins over aria2's partial
+            restored.append(os.path.basename(p))
+        except OSError:
+            pass
+    return restored
+
+
+def recover_protected_files(client_dir: str, files):
+    """Undo a shield interrupted by a crash: an orphaned '.octobak' beside a
+    torrent file is the real file — move it back into place."""
+    for parts, _length in files:
+        p   = os.path.join(client_dir, *parts)
+        bak = p + _SHIELD_SUFFIX
+        if os.path.exists(bak):
+            try:
+                os.replace(bak, p)
+            except OSError:
+                pass
 
 
 def torrent_selection(client_dir: str, files, drop_mismatched=False,
@@ -1064,6 +1126,10 @@ class UpdateWorker:
                     and os.path.exists(wow_path)):
                 shutil.copyfile(PRISTINE_WOW_PATH, wow_path)
 
+            # Put back any file a prior run shielded but couldn't restore (crash
+            # mid-sync), so its version isn't stranded as a .octobak.
+            recover_protected_files(self.out_dir, files)
+
             # speech.MPQ is left unverified/un-updated when the user keeps a
             # custom one (Settings → Ignore speech.mpq).
             ignore_speech = bool(load_config().get("ignore_speech", False))
@@ -1095,10 +1161,21 @@ class UpdateWorker:
                     frac = p["done"] / p["total"] if p["total"] else 0.0
                     self.progress(min(frac, 1.0), label)
 
-                run_aria2c(self.out_dir, select_files=need,
-                           check_integrity=self.check_integrity,
-                           on_progress=_prog,
-                           should_cancel=lambda: self._cancel, log_fn=self.log)
+                # Excluded files (mod-owned + kept speech.MPQ) can still be
+                # rewritten by aria2 through a shared torrent piece. Move them
+                # aside for the sync and put them back after, so the Mods tab /
+                # custom speech stays authoritative.
+                shielded = shield_protected_files(self.out_dir, files,
+                                                  ignore_speech)
+                try:
+                    run_aria2c(self.out_dir, select_files=need,
+                               check_integrity=self.check_integrity,
+                               on_progress=_prog,
+                               should_cancel=lambda: self._cancel,
+                               log_fn=self.log)
+                finally:
+                    for name in unshield_protected_files(shielded):
+                        self.log(f"  kept mod file: {name}", "dim")
             else:
                 self.log("All game files already present.", "dim")
 

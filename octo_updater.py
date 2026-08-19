@@ -9,6 +9,8 @@ import hashlib
 import os
 import sys
 import ssl
+import re
+import subprocess
 import urllib.request
 from urllib.parse import urlsplit
 import shutil
@@ -18,6 +20,7 @@ import time
 import math
 import threading
 import queue
+from functools import cache
 import tkinter as tk
 from tkinter import filedialog
 from pathlib import Path
@@ -26,32 +29,69 @@ from pathlib import Path
 #  Constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-UPDATER_VERSION  = "1.2"
+UPDATER_VERSION  = "1.3"
 SERVER           = "https://octowow.st"
-DOWNLOAD_VERSION = "latest"
 UA               = f"OctoUpdater/{UPDATER_VERSION}"
 DOWNLOAD_RETRY   = 5
 DOWNLOAD_TIMEOUT = 10    # seconds without any data before a transfer aborts
 
-# Where the app keeps its files: next to the .exe when frozen (PyInstaller),
-# otherwise next to this script — never the current working directory, which
-# varies with how the app was launched.
+# Where the app lives: next to the .exe when frozen (PyInstaller), otherwise
+# next to this script — never the current working directory, which varies with
+# how the app was launched. This anchors the default game folder.
 if getattr(sys, "frozen", False):
     APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-CONFIG_FILE      = os.path.join(APP_DIR, "octo_updater_config.json")
+
+def _default_app_data_dir() -> str:
+    base = os.environ.get("LOCALAPPDATA")
+    if base:
+        path = os.path.join(base, "OctoUpdater")
+        try:
+            os.makedirs(path, exist_ok=True)
+            return path
+        except OSError:
+            pass
+    return APP_DIR
+
+
+APP_DATA_DIR = _default_app_data_dir()
+
+CONFIG_FILE = os.path.join(APP_DATA_DIR, "config.json")
 
 # First-run default game folder, anchored to the app dir (not the CWD).
-DEFAULT_OUT_DIR  = os.path.join(APP_DIR, "OctoWoW")
+DEFAULT_GAME_DIR = os.path.join(APP_DIR, "OctoWoW")
 
-# News feed: announcements come from the forum list endpoint.
-NEWS_URL          = f"{SERVER}/forum/octonews.php?mode=list&forum=2&limit=8"
-NEWS_FEATURED_URL = f"{SERVER}/forum/octonews.php?forum=35&mode=full"
+
+def _relocate_legacy_data():
+    # Old config (<1.3: octo_updater_config.json beside the app) becomes
+    # config.json in APP_DATA_DIR. Rename + relocate, only when the old name
+    # exists and the new path doesn't (idempotent). The legacy game-hash cache
+    # is no longer used and is deleted by _migrate_1_3.
+    old_name, new = "octo_updater_config.json", CONFIG_FILE
+    for old in (os.path.join(APP_DIR, old_name),
+                os.path.join(APP_DATA_DIR, old_name)):
+        if old == new or not os.path.exists(old) or os.path.exists(new):
+            continue
+        try:
+            shutil.move(old, new)
+            sys.stderr.write(f"[data] moved {old_name} -> {new}\n")
+            break
+        except OSError as e:
+            sys.stderr.write(f"[data] could not move {old_name}: {e}\n")
+
+# News tab: the latest announcement (forum 2, full post) fills the left panel,
+# the patch-notes list (forum 4) fills the right.
+NEWS_FEATURED_URL = f"{SERVER}/forum/octonews.php?forum=2&mode=full"
+PATCHNOTES_URL    = f"{SERVER}/forum/octonews.php?mode=list&forum=4&limit=8"
 NEWS_TIMEOUT      = 8
 NEWS_CACHE_TTL    = 300
 
+# Design dimensions, authored at 96 DPI (100% scaling). At startup the app
+# multiplies these — and every other hard-coded pixel value, via self._px() —
+# by a single DPI scale factor, so the whole fixed-pixel layout scales as a
+# unit instead of point-fonts overflowing fixed geometry on high-DPI displays.
 WIN_W, WIN_H = 1000, 700
 FOOT_H       = 130
 
@@ -116,7 +156,9 @@ except (AttributeError, ValueError):
 # redirecting a download (e.g. a mod DLL) to an unexpected host.
 ALLOWED_DOWNLOAD_HOSTS = {
     "octowow.st",
+    "dl.octowow.st",
     "github.com",
+    "raw.githubusercontent.com",
     "objects.githubusercontent.com",
     "release-assets.githubusercontent.com",
     "codeberg.org",
@@ -258,10 +300,14 @@ def get_client_version(out_dir: str) -> str:
 
 
 def fmt_size(num_bytes: float) -> str:
-    """Human-readable size: KB under a megabyte, MB otherwise."""
-    if num_bytes < 1024 * 1024:
-        return f"{num_bytes / 1024:.0f} KB"
-    return f"{num_bytes / 1024 / 1024:.1f} MB"
+    """Human-readable size: KB, MB, GB. Uses binary (1024) steps but the
+    familiar KB/MB/GB labels. Truncated, not rounded, so 8.7998 GiB reads as
+    '8.79 GB' instead of rounding up to 8.80 and overstating the size."""
+    if num_bytes < 1024 ** 2:
+        return f"{int(num_bytes / 1024)} KB"
+    if num_bytes < 1024 ** 3:
+        return f"{int(num_bytes / 1024 ** 2 * 10) / 10:.1f} MB"
+    return f"{int(num_bytes / 1024 ** 3 * 100) / 100:.2f} GB"
 
 
 def fmt_speed(bytes_per_sec: float) -> str:
@@ -270,67 +316,576 @@ def fmt_speed(bytes_per_sec: float) -> str:
     return f"{bytes_per_sec / 1024 / 1024:.1f} MB/s"
 
 
-def sha1_file(path) -> str:
-    h = hashlib.sha1()
+# ──────────────────────────────────────────────────────────────────────────────
+#  Torrent-based client sync (aria2c)
+# ──────────────────────────────────────────────────────────────────────────────
+# Client files are synced over BitTorrent with aria2c, fetched on first use.
+# The download is differential: only files that are missing or the wrong size
+# are pulled.
+
+CLIENT_TORRENT_URL = "https://dl.octowow.st/download/client.torrent"
+
+# Pinned aria2 Windows build. aria2 is GPLv2+, fetched and run unmodified; only
+# aria2c.exe is used. The sha256 is of the release .zip (verified once).
+ARIA2_ZIP_URL    = ("https://github.com/aria2/aria2/releases/download/"
+                    "release-1.37.0/aria2-1.37.0-win-32bit-build1.zip")
+ARIA2_ZIP_SHA256 = "35f6514cc5dd7e98a87b3c4c2d25a0754b9b063dbe59bc0f22d483464f61e5b6"
+ARIA2C_PATH      = os.path.join(APP_DATA_DIR, "aria2c.exe")
+
+# The torrent's top-level folder name: aria2 writes files under <dir>/<name>/…,
+# so a junction <staging>/client → the real client dir lands them in place.
+TORRENT_NAME       = "client"
+TORRENT_STAGING_DIR = os.path.join(APP_DATA_DIR, "torrent-root")
+PRISTINE_WOW_PATH  = os.path.join(APP_DATA_DIR, "base-WoW.exe")
+
+# The pristine (unpatched) WoW.exe carries 0xa1 at this offset; a patched one
+# carries 0xb8 (see the locale patch). Used to cache a clean base for re-patch.
+_LOCALE_ASSERT_OFFSET = 0x1b2115
+
+# Game-language (WoW.exe locale) patch
+# The language is switched by patching three spots in WoW.exe. 
+# LOCALE_NAMES is the exe's built-in 8-slot locale table (at
+# 0x45591c - index*8). Selectable languages map to a slot index; ruRU and ptBR
+# reuse the unused zhTW / xxYY slots and rename them. Offsets/bytes verified
+# against the pristine base-WoW.exe.
+_LOCALE_TAG_OFFSET   = 0x1b2115                 # the 0xa1/0xb8 assert instruction
+_LOCALE_INDEX_OFFSET = 0x253c
+_LOCALE_NAME_OFFSET  = lambda i: 0x45591c - i * 8
+LOCALE_NAMES = ["enUS", "koKR", "frFR", "deDE",
+                "zhCN", "zhTW", "esES", "xxYY"]
+# selectable code -> (slot index, display label), in menu order
+LOCALES = {
+    "enUS": (0, "English"),
+    "deDE": (3, "Deutsch"),
+    "ruRU": (5, "Русский"),
+    "zhCN": (4, "中文 (简体)"),
+    "esES": (6, "Español"),
+    "ptBR": (7, "Português (BR)"),
+}
+DEFAULT_LOCALE = "enUS"
+
+
+def locale_patches(locale: str):
+    """The three WoW.exe byte edits that force the given game language, as
+    (offset, bytes) tuples applied on top of the pristine base."""
+    if locale not in LOCALES:
+        locale = DEFAULT_LOCALE
+    idx, _ = LOCALES[locale]
+    carrier = LOCALE_NAMES[idx]                 # exe slot name at this index
+    return [
+        # assert instruction: mov eax, <carrier as reversed dword> (was mov eax,[imm])
+        (_LOCALE_TAG_OFFSET,
+         bytes([0xb8]) + bytes(carrier, "latin1")[::-1]),
+        # locale index: mov esi, <index>; jmp +0x1f
+        (_LOCALE_INDEX_OFFSET,
+         bytes([0xbe, idx, 0x00, 0x00, 0x00, 0xeb, 0x1f])),
+        # rename the slot's locale-name string to the selected tag
+        (_LOCALE_NAME_OFFSET(idx), bytes(locale, "latin1")),
+    ]
+
+
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def ensure_aria2c(log_fn=log) -> str:
+    """Return the path to aria2c.exe, downloading + checksum-verifying it into
+    APP_DATA_DIR on first use. Raises on failure."""
+    if os.path.exists(ARIA2C_PATH):
+        return ARIA2C_PATH
+    log_fn("Fetching aria2c (one-time, ~2.5 MB)…", "acct")
+    req = urllib.request.Request(ARIA2_ZIP_URL, headers={"User-Agent": UA})
+    with secure_urlopen(req, timeout=60, allowed_hosts=ALLOWED_DOWNLOAD_HOSTS) as r:
+        data = r.read()
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != ARIA2_ZIP_SHA256:
+        raise RuntimeError(
+            f"aria2 checksum mismatch (got {digest[:12]}…); refusing to run it")
+    import zipfile, io
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        name = next((n for n in zf.namelist()
+                     if n.lower().endswith("aria2c.exe")), None)
+        if not name:
+            raise RuntimeError("aria2c.exe not found in the aria2 archive")
+        exe = zf.read(name)
+    ensure_dir(APP_DATA_DIR)
+    tmp = ARIA2C_PATH + ".part"
+    with open(tmp, "wb") as f:
+        f.write(exe)
+    os.replace(tmp, ARIA2C_PATH)
+    log_fn("aria2c ready.", "ok")
+    return ARIA2C_PATH
+
+
+def _bdecode(buf: bytes, pos: int = 0):
+    """Minimal bencode decoder → (value, next_pos). Strings stay bytes."""
+    ch = buf[pos]
+    if ch == 0x69:                                   # i<int>e
+        end = buf.index(b"e", pos)
+        return int(buf[pos + 1:end]), end + 1
+    if ch == 0x6c:                                   # l<items>e
+        lst, p = [], pos + 1
+        while buf[p] != 0x65:
+            v, p = _bdecode(buf, p)
+            lst.append(v)
+        return lst, p + 1
+    if ch == 0x64:                                   # d<pairs>e
+        d, p = {}, pos + 1
+        while buf[p] != 0x65:
+            k, p = _bdecode(buf, p)
+            v, p = _bdecode(buf, p)
+            d[k] = v
+        return d, p + 1
+    colon = buf.index(b":", pos)                     # <len>:<bytes>
+    n = int(buf[pos:colon])
+    start = colon + 1
+    return buf[start:start + n], start + n
+
+
+def fetch_torrent(url: str = CLIENT_TORRENT_URL) -> tuple:
+    """Download the .torrent → (raw_bytes, files). `files` is a list of
+    (path_parts, length). The raw bytes' SHA-1 is the client 'version'."""
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with secure_urlopen(req, timeout=DOWNLOAD_TIMEOUT,
+                        allowed_hosts=ALLOWED_DOWNLOAD_HOSTS) as r:
+        raw = r.read()
+    decoded, _ = _bdecode(raw)
+    info = decoded.get(b"info", {})
+    files = [([p.decode("latin1") for p in f.get(b"path", [])],
+              int(f.get(b"length", 0)))
+             for f in info.get(b"files", [])]
+    return raw, files
+
+
+def torrent_version(raw: bytes) -> str:
+    """SHA-1 of the whole .torrent file — the client 'version'. Changes whenever
+    the torrent is re-rolled, so it's what we compare to detect a new build and
+    decide whether aria2's resume state is stale. An occasional re-check when
+    only the announce/date changed (content unchanged) is harmless."""
+    return hashlib.sha1(raw).hexdigest()
+
+
+@cache
+def _torrent_excluded_files() -> frozenset:
+    """Lower-cased basenames of every file the Mods tab installs, across all
+    mods — the client-root files the torrent sync leaves to the mod system.
+
+    The torrent ships several of them (VfPatcher.dll, nampower.dll, d3d9.dll,
+    …), but the Mods tab is the single source of truth for installing /
+    disabling / versioning them, so the sync must never fetch, re-add, or flag
+    them. Computed once and memoized (MODS_REGISTRY is static at import)."""
+    return frozenset(
+        os.path.basename(f).lower()
+        for mod in MODS_REGISTRY
+        for f in mod.get("installed_files", [])
+    )
+
+
+def _is_torrent_excluded(parts) -> bool:
+    return len(parts) == 1 and parts[0].lower() in _torrent_excluded_files()
+
+
+def _torrent_skip(parts, ignore_speech: bool) -> bool:
+    """Files the sync must leave alone: mod-owned client-root files, plus
+    speech.MPQ when the user opted to keep a custom one (Settings)."""
+    if _is_torrent_excluded(parts):
+        return True
+    return ignore_speech and bool(parts) and parts[-1].lower() == "speech.mpq"
+
+
+def torrent_selection(client_dir: str, files, drop_mismatched=False,
+                      ignore_speech=False):
+    """1-indexed list of torrent files that are missing or the wrong size on
+    disk (aria2 --select-file), plus whether any were entirely missing."""
+    need, missing = [], False
+    for i, (parts, length) in enumerate(files):
+        if _torrent_skip(parts, ignore_speech):
+            continue
+        dest = os.path.join(client_dir, *parts)
+        try:
+            size = os.path.getsize(dest)
+        except OSError:
+            missing = True
+            need.append(i + 1)
+            continue
+        if size != length:
+            # oversized/corrupt file poisons resume — drop it; a short file is
+            # kept so aria2 can resume it
+            if drop_mismatched or size > length:
+                try:
+                    os.remove(dest)
+                except OSError:
+                    pass
+            need.append(i + 1)
+    return need, missing
+
+
+def torrent_all_selection(files, ignore_speech=False) -> list:
+    """1-indexed list of every non-mod file in the torrent. Used for an
+    integrity pass: aria2 --check-integrity verifies each selected file's piece
+    hashes and re-downloads only the bad/missing pieces — catching same-size but
+    corrupted files that the size-based torrent_selection can't."""
+    return [i + 1 for i, (parts, _) in enumerate(files)
+            if not _torrent_skip(parts, ignore_speech)]
+
+
+def torrent_tree_intact(client_dir: str, files, ignore_speech=False) -> bool:
+    for parts, length in files:
+        if _torrent_skip(parts, ignore_speech):
+            continue
+        try:
+            if os.path.getsize(os.path.join(client_dir, *parts)) != length:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+# Legacy leftovers the current client no longer ships. Locale data folders are
+# matched by name; the old patch archives by name AND exact size, so a player
+# mod that reused one of these names is never deleted.
+_LOCALE_DATA_DIRS = {
+    "enus", "engb", "encn", "entw", "kokr", "frfr", "dede", "zhcn",
+    "zhtw", "eses", "esmx", "ruru", "ptbr", "ptpt", "itit",
+}
+_LEGACY_ARCHIVES = {
+    "patch-6.mpq": 451195806,
+    "patch-7.mpq": 175256564,
+    "patch-8.mpq": 484649870,
+    "patch-9.mpq": 506808141,
+    "patch-a.mpq": 241751337,
+}
+
+
+def prune_stale_client_files(client_dir: str, files) -> list:
+    """Remove legacy Data/<locale>/ folders and known old-client patch MPQs the
+    current torrent no longer ships. Folders are removed by name (unless the torrent
+    still uses them); archives only when the name AND the exact size match a known
+    legacy one. Returns removed names."""
+    data_dir = os.path.join(client_dir, "Data")
+    if not os.path.isdir(data_dir):
+        return []
+    # what the current torrent puts directly in Data/ (.mpq files and subdirs)
+    expected, used_dirs = set(), set()
+    for parts, _length in files:
+        if not parts or parts[0] != "Data":
+            continue
+        if len(parts) == 2 and parts[1].lower().endswith(".mpq"):
+            expected.add(parts[1].lower())
+        elif len(parts) >= 3:
+            used_dirs.add(parts[1].lower())
+
+    removed = []
+    for name in os.listdir(data_dir):
+        lc, full = name.lower(), os.path.join(data_dir, name)
+        if os.path.isdir(full):
+            if lc in _LOCALE_DATA_DIRS and lc not in used_dirs:
+                try:
+                    shutil.rmtree(full)
+                    removed.append(name + "/")
+                except OSError:
+                    pass
+            continue
+        if not lc.endswith(".mpq") or lc in expected:
+            continue
+        try:
+            size = os.path.getsize(full)
+        except OSError:
+            continue
+        if _LEGACY_ARCHIVES.get(lc) == size:
+            try:
+                os.remove(full)
+                removed.append(name)
+            except OSError:
+                pass
+    return removed
+
+
+# Downloadable MPQ content patches (not shipped with the client). Each is
+# a single HTTP file with a `<url>.sha256` sidecar; an update is available when
+# that published sha differs from the on-disk file's.
+MPQ_PATCHES = [
+    {
+        "file": "patch-O.mpq",
+        "name": "Octo Raid Visuals",
+        "description": "Adds ground markers and sounds for boss abilities in raids.",
+        "url":  "https://dl.octowow.st/client/latest/Data/patch-O.mpq",
+    },
+]
+
+
+def mpq_patch_for(filename: str):
+    """The registry entry whose file matches `filename` (case-insensitive)."""
+    lc = filename.lower()
+    return next((e for e in MPQ_PATCHES if e["file"].lower() == lc), None)
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
-    return h.hexdigest().upper()
+    return h.hexdigest().lower()
 
 
-CACHE_FILE = os.path.join(APP_DIR, "octo_updater_hash_cache.json")
+def fetch_mpq_sha256(url: str) -> str:
+    """The published SHA256 of an MPQ patch, from its `<url>.sha256` sidecar."""
+    req = urllib.request.Request(url + ".sha256", headers={"User-Agent": UA})
+    with secure_urlopen(req, timeout=NEWS_TIMEOUT,
+                        allowed_hosts=ALLOWED_DOWNLOAD_HOSTS) as r:
+        return r.read().decode("ascii", "ignore").strip().split()[0].lower()
 
-def load_cache() -> dict:
+
+def download_mpq_patch(entry: dict, data_dir: str, on_progress=None):
+    """Download the patch into <data_dir>/<file>, verifying its published
+    SHA256. Writes to a .part file and renames on success. on_progress(done,
+    total) is called as bytes arrive."""
+    url = entry["url"]
+    want = fetch_mpq_sha256(url)
+    ensure_dir(data_dir)
+    tmp = os.path.join(data_dir, entry["file"] + ".part")
+    h = hashlib.sha256()
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with secure_urlopen(req, timeout=DOWNLOAD_TIMEOUT,
+                        allowed_hosts=ALLOWED_DOWNLOAD_HOSTS) as r:
+        total = int(r.headers.get("Content-Length") or 0)
+        done  = 0
+        with open(tmp, "wb") as f:
+            while True:
+                chunk = r.read(256 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                h.update(chunk)
+                done += len(chunk)
+                if on_progress:
+                    on_progress(done, total)
+    if h.hexdigest().lower() != want:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise RuntimeError("checksum verification failed")
+    os.replace(tmp, os.path.join(data_dir, entry["file"]))
+
+
+def clear_torrent_resume_state():
+    """Delete aria2's saved control (.aria2) and metadata (.torrent) files in
+    the staging dir. They pin a specific torrent revision (info-hash) and record
+    which pieces are 'done', so a stale one causes an 'info hash mismatch' error
+    after the client torrent is re-rolled, or blocks re-downloading a file the
+    user deleted. Safe to call when nothing is there."""
     try:
-        with open(CACHE_FILE) as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-    except Exception as e:
-        sys.stderr.write(f"[cache] failed to read {CACHE_FILE}: {e}\n")
-        return {}
+        for name in os.listdir(TORRENT_STAGING_DIR):
+            if name.endswith((".aria2", ".torrent")):
+                try:
+                    os.remove(os.path.join(TORRENT_STAGING_DIR, name))
+                except OSError:
+                    pass
+    except OSError:
+        pass
 
-def save_cache(cache: dict):
+
+def refresh_pristine_wow(client_dir: str):
+    """Cache the freshly-synced (unpatched) WoW.exe as the pristine base, so a
+    later re-patch always starts from clean bytes."""
+    exe = os.path.join(client_dir, "WoW.exe")
     try:
-        _atomic_write(CACHE_FILE, json.dumps(cache))
-    except Exception as e:
-        sys.stderr.write(f"[cache] failed to write {CACHE_FILE}: {e}\n")
+        with open(exe, "rb") as f:
+            f.seek(_LOCALE_ASSERT_OFFSET)
+            pristine = f.read(1) == b"\xa1"
+        if pristine:
+            shutil.copyfile(exe, PRISTINE_WOW_PATH)
+            log("Cached pristine WoW.exe base.", "dim")
+    except OSError:
+        pass
 
-def cached_sha1(path_str: str, cache: dict) -> str:
+
+def read_pristine_wow(client_dir: str) -> bytes:
+    """The clean base to patch from: the cached pristine exe if present, else
+    the on-disk WoW.exe."""
+    if os.path.exists(PRISTINE_WOW_PATH):
+        with open(PRISTINE_WOW_PATH, "rb") as f:
+            return f.read()
+    with open(os.path.join(client_dir, "WoW.exe"), "rb") as f:
+        return f.read()
+
+
+def _ensure_torrent_junction(client_dir: str) -> str:
+    """Point <staging>/client at client_dir via an NTFS junction (no admin) so
+    aria2 writes the torrent's files straight into the real client dir. Returns
+    the staging dir to pass as aria2 --dir."""
+    staging = TORRENT_STAGING_DIR
+    ensure_dir(staging)
+    link   = os.path.join(staging, TORRENT_NAME)
+    target = os.path.abspath(client_dir)
     try:
-        mtime = os.path.getmtime(path_str)
-        entry = cache.get(path_str)
-        if entry and entry[1] == mtime:
-            return entry[0]
-        h = sha1_file(path_str)
-        cache[path_str] = [h, mtime]
-        return h
-    except Exception:
-        return ""
-
-
-def already_updated(dest, expected_hash) -> bool:
-    if not os.path.exists(dest):
-        return False
+        if os.path.isdir(link) and \
+                os.path.abspath(os.path.realpath(link)) == target:
+            return staging
+    except OSError:
+        pass
+    # remove a stale junction/link (rmdir drops the reparse point, not its
+    # target's contents) then recreate it
     try:
-        return sha1_file(dest) == expected_hash
-    except Exception:
-        return False
+        os.rmdir(link)
+    except OSError:
+        try:
+            os.remove(link)
+        except OSError:
+            pass
+    r = subprocess.run(["cmd", "/c", "mklink", "/J", link, target],
+                       capture_output=True, text=True, creationflags=_NO_WINDOW)
+    if not os.path.isdir(link):
+        raise RuntimeError("could not create download junction: "
+                           + (r.stderr or r.stdout or "").strip())
+    return staging
+
+
+_SIZE_UNITS = {"B": 1, "KiB": 1024, "MiB": 1024 ** 2,
+               "GiB": 1024 ** 3, "TiB": 1024 ** 4}
+_UNIT = "|".join(_SIZE_UNITS)              # B|KiB|MiB|GiB|TiB
+_SIZE = rf"[\d.]+(?:{_UNIT})"              # e.g. 8.8GiB
+_FRAC = rf"({_SIZE})/({_SIZE})\((\d+)%\)"  # done/total(percent%)
+_ARIA_FRAC = re.compile(_FRAC)
+_ARIA_DL   = re.compile(rf"DL:({_SIZE})")
+# During --check-integrity aria2 prints the hash-check progress in a separate
+# field, e.g. '… [Checksum:#f66a3e 236MiB/1.5GiB(15%)]', while the leading
+# completed/total stays at 0%/0B (a complete client downloads nothing). Read the
+# Checksum fraction so the bar tracks the check instead of freezing at 0.
+_ARIA_CHK  = re.compile(rf"Checksum:#\w+\s+{_FRAC}")
+
+
+def _to_bytes(s: str) -> float:
+    m = re.match(rf"^([\d.]+)({_UNIT})$", s.strip())
+    return float(m.group(1)) * _SIZE_UNITS[m.group(2)] if m else 0.0
+
+
+def parse_aria_progress(line: str):
+    """Parse an aria2 summary line like '1.2GiB/8.8GiB(13%) … DL:5.0MiB' →
+    {progress, done, total, bps, checking}, or None for non-progress lines.
+    A checksum-check line is preferred over the (idle) download fraction."""
+    chk = _ARIA_CHK.search(line)
+    m   = chk or _ARIA_FRAC.search(line)
+    if not m:
+        return None
+    dl = _ARIA_DL.search(line)
+    return {"progress": int(m.group(3)) / 100.0,
+            "done":  _to_bytes(m.group(1)),
+            "total": _to_bytes(m.group(2)),
+            "bps":   _to_bytes(dl.group(1)) if dl else 0.0,
+            "checking": chk is not None}
+
+
+# The currently-running aria2c child, so it can be killed when the app quits
+# (a daemon worker thread dying would otherwise orphan it, still downloading
+# headless). --stop-with-process is aria2's own belt-and-suspenders for this,
+# but it's unreliable on Windows — hence the explicit kill too.
+_active_aria2: "subprocess.Popen | None" = None
+_active_aria2_lock = threading.Lock()
+
+
+def stop_aria2c():
+    """Terminate the running aria2c child, if any. Safe to call from any thread
+    (e.g. the app's close handler)."""
+    global _active_aria2
+    with _active_aria2_lock:
+        proc, _active_aria2 = _active_aria2, None
+    if proc and proc.poll() is None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
+def run_aria2c(client_dir, select_files=None, check_integrity=False,
+               on_progress=None, should_cancel=None, log_fn=log):
+    """Sync the client torrent into client_dir with aria2c (leech-only). Blocks
+    until aria2c exits; raises on a non-zero exit or cancellation. Calls
+    on_progress(dict) per update and should_cancel()->bool to abort.
+
+    aria2 is handed the .torrent URL (not a local copy), so it always fetches
+    the server's current torrent at download time — no chance of running a stale
+    local .torrent if the user starts the update long after the verify."""
+    global _active_aria2
+    exe     = ensure_aria2c(log_fn)
+    staging = _ensure_torrent_junction(client_dir)
+    args = [
+        exe,
+        f"--dir={staging}",
+        # aria2 exits when this PID (the updater) does — stops an orphaned
+        # download if we're killed before the explicit stop_aria2c() runs.
+        f"--stop-with-process={os.getpid()}",
+        "--seed-time=0",
+        f"--check-integrity={'true' if check_integrity else 'false'}",
+        "--bt-remove-unselected-file=false",
+        "--continue=true",
+        "--allow-overwrite=true",
+        "--auto-file-renaming=false",
+        "--file-allocation=none",
+        "--disk-cache=128M",
+        "--stream-piece-selector=inorder",
+        "--max-tries=0",
+        "--retry-wait=5",
+        "--bt-stop-timeout=120",
+        "--auto-save-interval=15",
+        "--summary-interval=1",
+        "--human-readable=false",
+        "--truncate-console-readout=false",
+        "--console-log-level=warn",
+        "--enable-dht=true",
+        "--bt-enable-lpd=true",
+        "--max-connection-per-server=8",
+        "--split=16",
+        "--min-split-size=1M",
+    ]
+    if select_files:
+        args.append("--select-file=" + ",".join(str(i) for i in select_files))
+    args.append(CLIENT_TORRENT_URL)
+
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True,
+                            bufsize=1, creationflags=_NO_WINDOW)
+    with _active_aria2_lock:
+        _active_aria2 = proc
+    try:
+        for line in proc.stdout:
+            if should_cancel and should_cancel():
+                proc.terminate()
+                raise RuntimeError("Cancelled")
+            line = line.strip()
+            if not line:
+                continue
+            p = parse_aria_progress(line)
+            if p:
+                # aria2's console readout floods idle '0B/total(0%)' lines (no
+                # bytes, no checksum) between the once-a-second summary blocks
+                # that carry the real figure. Drop the idle ones so they can't
+                # stomp progress back to 0 under the UI's latest-wins draining.
+                informative = (p["done"] or p["progress"]
+                               or p["bps"] or p["checking"])
+                if on_progress and informative:
+                    on_progress(p)
+            else:
+                log_fn(f"[aria2] {line}", "dim")
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        with _active_aria2_lock:
+            if _active_aria2 is proc:
+                _active_aria2 = None
+    code = proc.wait()
+    if code != 0:
+        raise RuntimeError(f"aria2c exited with code {code}")
 
 
 class VerifyWorker:
-    def __init__(self, out_dir: str, log_q: queue.Queue, prog_q: queue.Queue,
-                 expected_patched_wow_hash: str = "",
-                 original_server_wow_hash: str = "",
-                 overwrite_config: bool = False):
+    def __init__(self, out_dir: str, log_q: queue.Queue, prog_q: queue.Queue):
         self.out_dir = out_dir
         self.log_q   = log_q
         self.prog_q  = prog_q
         self._cancel = False
-        self.expected_patched_wow_hash = expected_patched_wow_hash
-        self.original_server_wow_hash  = original_server_wow_hash
-        self.overwrite_config = overwrite_config
-        self._cache: dict = load_cache()
 
     def cancel(self):
         self._cancel = True
@@ -341,90 +896,42 @@ class VerifyWorker:
     def progress(self, value, label=""):
         self.prog_q.put((value, label))
 
-    def _file_ok(self, dest, server_hash, name):
-        if not os.path.exists(dest):
-            return False
-        local_hash = cached_sha1(dest, self._cache)
-        if local_hash == server_hash:
-            return True
-        if name == "WoW.exe" and self.expected_patched_wow_hash:
-            return (local_hash == self.expected_patched_wow_hash
-                    and server_hash == self.original_server_wow_hash)
-        return False
-
-    def _traverse(self, node, path_parts):
-        if self._cancel:
-            return None
-        t    = node["type"]
-        name = node["name"]
-        cur  = path_parts + [name]
-
-        if t == "dir":
-            stale = [c for child in node.get("files", [])
-                     if (c := self._traverse(child, cur)) is not None]
-            return {**node, "files": stale} if stale else None
-
-        dest = os.path.join(self.out_dir, os.path.join(*cur))
-
-        if t == "del":
-            return node if os.path.exists(dest) else None
-
-        if t == "file":
-            return None if self._file_ok(dest, node["hash"], name) else node
-
-        if t == "mpq":
-            mpq_dest = os.path.join(self.out_dir, os.path.join(*(path_parts + [name + ".mpq"])))
-            return None if self._file_ok(mpq_dest, node["hash"], name + ".mpq") else node
-
-        return None
-
     def run(self):
         try:
-            self.progress(0.02, "Fetching manifest...")
-            self.log("Verifying files...", "acct")
-            req = urllib.request.Request(
-                f"{SERVER}/api/file/{DOWNLOAD_VERSION}/manifest.json",
-                headers={"User-Agent": UA})
-            with secure_urlopen(req, timeout=DOWNLOAD_TIMEOUT) as r:
-                manifest = json.load(r)
-            self.progress(0.5, "Checking...")
+            self.log("Checking for updates…", "acct")
+            raw, files = fetch_torrent()
+            self.log("Checking game files…", "acct")
 
-            stale_nodes = [c for child in manifest["root"].get("files", [])
-                           if (c := self._traverse(child, [])) is not None]
+            # aria2 selects by size (a patched WoW.exe keeps the torrent's size,
+            # so it's never flagged); need == files missing or wrong-sized.
+            ignore_speech = bool(load_config().get("ignore_speech", False))
+            need, _missing = torrent_selection(self.out_dir, files,
+                                               ignore_speech=ignore_speech)
+            have_exe = os.path.exists(os.path.join(self.out_dir, "WoW.exe"))
 
-            self.progress(1.0, "")
-            save_cache(self._cache)
-
-            # Config.wtf isn't part of the manifest — it's user game config.
-            # Create it when missing, or overwrite it when the user
-            # committed to this folder.
-            cfg_wtf = os.path.join(self.out_dir, "WTF", "Config.wtf")
-            if self.overwrite_config or not os.path.exists(cfg_wtf):
-                write_config_wtf(self.out_dir)
-
-            if stale_nodes:
-                self.log("Update available.", "acct")
-                self.log_q.put(("__UPDATE_NEEDED__", ""))
-                self.log_q.put(("__DIFF_TREE__", stale_nodes))
-            else:
+            if have_exe and not need:
                 self.log("Everything is up to date!", "ok")
                 self.log_q.put(("__UP_TO_DATE__", ""))
+            else:
+                self.log("Update available.", "acct")
+                self.log_q.put(("__UPDATE_NEEDED__", ""))
         except Exception as e:
             self.log(f"Verification failed: {e}", "err")
             self.log_q.put(("__UPDATE_NEEDED__", ""))
-            self.log_q.put(("__DIFF_TREE__", None))
 
 
 class UpdateWorker:
     def __init__(self, out_dir: str, log_q: queue.Queue, prog_q: queue.Queue,
-                 expected_patched_wow_hash: str = ""):
+                 check_integrity: bool = False, overwrite_config: bool = False):
         self.out_dir = out_dir
         self.log_q   = log_q
         self.prog_q  = prog_q
         self._cancel = False
-        self._cache: dict = load_cache()
-        self.expected_patched_wow_hash = expected_patched_wow_hash
-        self.original_server_wow_hash  = ""
+        # Integrity mode: aria2 hash-checks every file's pieces and repairs
+        # them (catches same-size corruption size-based selection misses).
+        self.check_integrity  = check_integrity
+        # Write a fresh Config.wtf on a reconcile.
+        self.overwrite_config = overwrite_config
 
     def cancel(self):
         self._cancel = True
@@ -434,170 +941,6 @@ class UpdateWorker:
 
     def progress(self, value: float, label: str = ""):
         self.prog_q.put((value, label))
-
-    def download(self, url, dest, size, name=""):
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        tmp  = dest + ".tmp"
-        name = name or os.path.basename(dest)
-        total_str = fmt_size(size) if size else "?"
-
-        for attempt in range(1, DOWNLOAD_RETRY + 1):
-            if self._cancel:
-                raise RuntimeError("Cancelled")
-            try:
-                # Resume a previous partial download when one is present.
-                got = os.path.getsize(tmp) if os.path.exists(tmp) else 0
-                if size and got >= size:
-                    os.remove(tmp)   # oversized/stale leftover — start clean
-                    got = 0
-
-                headers = {"User-Agent": UA}
-                mode    = "wb"
-                if got:
-                    headers["Range"] = f"bytes={got}-"
-                    mode = "ab"
-                    self.log(f"  Resuming ({fmt_size(got)} / {total_str})…")
-                else:
-                    self.log(f"  Downloading ({total_str})…")
-
-                req = urllib.request.Request(url, headers=headers)
-                downloaded = got
-                # Hash on the fly when starting from byte 0 — saves a full
-                # re-read of the file for verification. A resumed download
-                # can't be hashed incrementally (the prefix wasn't seen).
-                hasher = hashlib.sha1() if not got else None
-                # Speed sampling over a short sliding window.
-                t0 = time.monotonic()
-                bytes_at_t0 = downloaded
-                speed_str = ""
-                with secure_urlopen(req, timeout=DOWNLOAD_TIMEOUT,
-                                    allowed_hosts=ALLOWED_DOWNLOAD_HOSTS) as r:
-                    status = getattr(r, "status", None) or r.getcode()
-                    if got and status != 206:
-                        # Server ignored the Range header — start over.
-                        downloaded, mode = 0, "wb"
-                        hasher = hashlib.sha1()
-                        bytes_at_t0 = 0
-                    with open(tmp, mode) as f:
-                        while True:
-                            if self._cancel:
-                                raise RuntimeError("Cancelled")
-                            chunk = r.read(256 * 1024)
-                            if not chunk:
-                                break
-                            f.write(chunk)
-                            if hasher is not None:
-                                hasher.update(chunk)
-                            downloaded += len(chunk)
-                            now = time.monotonic()
-                            dt  = now - t0
-                            if dt >= 0.5:
-                                speed_str = "   •   " + fmt_speed(
-                                    (downloaded - bytes_at_t0) / dt)
-                                t0, bytes_at_t0 = now, downloaded
-                            if size:
-                                self.progress(
-                                    downloaded / size,
-                                    f"{name}   •   {fmt_size(downloaded)}"
-                                    f" / {total_str}{speed_str}")
-
-                # A dropped connection looks like a clean EOF — never accept
-                # a short file as a finished download.
-                if size and downloaded != size:
-                    raise IOError("connection lost at "
-                                  f"{fmt_size(downloaded)} / {total_str}")
-
-                shutil.move(tmp, dest)
-                if hasher is not None:
-                    digest = hasher.hexdigest().upper()
-                    try:
-                        # Seed the verify cache so the next verify pass
-                        # doesn't need to rehash this file either.
-                        self._cache[dest] = [digest, os.path.getmtime(dest)]
-                    except OSError:
-                        self._cache.pop(dest, None)
-                    return digest
-                self._cache.pop(dest, None)
-                return None
-            except Exception as e:
-                if self._cancel:
-                    raise RuntimeError("Cancelled")
-                # Keep tmp — the next attempt resumes from where this one
-                # stopped instead of redownloading from zero.
-                self.log(f"  Attempt {attempt} failed: {e}", "err")
-                if attempt < DOWNLOAD_RETRY:
-                    wait = min(2 ** attempt, 10)
-                    part = os.path.getsize(tmp) if os.path.exists(tmp) else 0
-                    self.progress(
-                        (part / size) if size else 0.0,
-                        f"{name} — retrying ({attempt}/{DOWNLOAD_RETRY})…")
-                    self.log(f"  Retrying in {wait} s…", "dim")
-                    time.sleep(wait)
-        raise RuntimeError(f"Download failed after {DOWNLOAD_RETRY} attempts: {url}")
-
-    def traverse(self, node, path_parts):
-        if self._cancel:
-            return
-        t    = node["type"]
-        name = node["name"]
-        cur  = path_parts + [name]
-
-        rel  = os.path.join(*cur)
-        dest = os.path.join(self.out_dir, rel)
-
-        if t == "dir":
-            for child in node.get("files", []):
-                self.traverse(child, cur)
-
-        elif t == "file":
-            self.log(f"[file] {rel}", "acct")
-            url = f"{SERVER}/client/{DOWNLOAD_VERSION}/{'/'.join(cur)}"
-
-            if name == "WoW.exe" and self.expected_patched_wow_hash:
-                server_hash = node["hash"]
-                original_server_hash = self.original_server_wow_hash
-                local_hash = sha1_file(dest) if os.path.exists(dest) else ""
-                already_patched = (
-                    local_hash == self.expected_patched_wow_hash
-                    and server_hash == original_server_hash
-                )
-                if already_patched:
-                    self.log("  Already up to date (patched).", "dim")
-                    return
-            elif already_updated(dest, node["hash"]):
-                self.log("  Already up to date.", "dim")
-                return
-
-            got_hash = self.download(url, dest, node["size"], rel)
-            if (got_hash or sha1_file(dest)) != node["hash"]:
-                self.log("  Hash mismatch — retrying", "err")
-                os.remove(dest)
-                got_hash = self.download(url, dest, node["size"], rel)
-                if (got_hash or sha1_file(dest)) != node["hash"]:
-                    raise RuntimeError(f"Hash mismatch after redownload: {rel}")
-
-        elif t == "mpq":
-            mpq_name = name + ".mpq"
-            cur_mpq  = path_parts + [mpq_name]
-            rel      = os.path.join(*cur_mpq)
-            dest     = os.path.join(self.out_dir, rel)
-            url      = f"{SERVER}/client/{DOWNLOAD_VERSION}/{'/'.join(cur_mpq)}"
-            self.log(f"[mpq]  {rel}", "acct")
-            if already_updated(dest, node["hash"]):
-                self.log("  Already up to date.", "dim")
-                return
-            got_hash = self.download(url, dest, node["size"], rel)
-            if (got_hash or sha1_file(dest)) != node["hash"]:
-                self.log("  Hash mismatch — retrying", "err")
-                os.remove(dest)
-                got_hash = self.download(url, dest, node["size"], rel)
-                if (got_hash or sha1_file(dest)) != node["hash"]:
-                    raise RuntimeError(f"Hash mismatch after redownload: {rel}")
-
-        elif t == "del":
-            self.log(f"[del]  {rel}", "dim")
-            if os.path.exists(dest):
-                os.remove(dest)
 
     def build_tweaks(self, buf, tweaks: dict | None = None):
         if tweaks is None:
@@ -614,9 +957,11 @@ class UpdateWorker:
         snd_bg    = 0x27 if tweaks.get("soundInBackground", TWEAKS_DEFAULTS["soundInBackground"]) else 0x14
 
         always_loot = tweaks.get("alwaysAutoLoot", TWEAKS_DEFAULTS["alwaysAutoLoot"])
+        locale      = tweaks.get("locale", TWEAKS_DEFAULTS["locale"])
 
         # fmt: off
         return [
+            ("gameLanguage", "bytes", None, locale_patches(locale)),
             ("largeAddress",          "uint16", 0x126,     flags),
             ("fieldOfView",           "float",  0x4089b4,  fov),
             ("cameraDistance",        "float",  0x4089a4,  cam_dist),
@@ -628,28 +973,15 @@ class UpdateWorker:
                 (0x0c1ecf, bytes([0x75 if always_loot else 0x74])),
                 (0x0c2b25, bytes([0x75 if always_loot else 0x74])),
             ]),
-            ("crossFactionResurrect", "bytes", None, [
-                (0x006e5fb8, bytes([0x006e5fb9 & 0xff])),
-                (0x006e62a8, bytes([0x006e62a9 & 0xff])),
-            ]),
-            ("cameraSkipFix", "bytes", None, [
-                (0x02ccd0, bytes([
-                    0x55,0x8b,0x05,0x48,0x4e,0x88,0x00,0x8b,0x0d,0x44,0x4e,0x88,0x00,0xe9,0x33,0x90,
-                    0x32,0x00,0x83,0xc0,0x32,0x83,0xc1,0x32,0x3b,0x0d,0xa8,0xeb,0xc4,0x00,0x7e,0x03,
-                    0x83,0xe9,0x01,0x3b,0x05,0xac,0xeb,0xc4,0x00,0x7e,0x03,0x83,0xe8,0x01,0x83,0xe9,
-                    0x32,0x83,0xe8,0x32,0x89,0x05,0x48,0x4e,0x88,0x00,0x89,0x0d,0x44,0x4e,0x88,0x00,
-                    0x5d,0xeb,0x0d,
-                ])),
-                (0x02d326, bytes([0xe9,0xb1,0x8a,0x32,0x00])),
-                (0x02d334, bytes([0x8b,0x35,0x48,0x4e,0x88,0x00])),
-                (0x355d15, bytes([
-                    0x83,0xf8,0x32,0x7d,0x03,0x83,0xc0,0x01,0x83,0xf9,0x32,
-                    0x7d,0x03,0x83,0xc1,0x01,0xe9,0xb8,0x6f,0xcd,0xff,
-                ])),
-                (0x355ddc, bytes([
-                    0x8d,0x4d,0xf0,0x51,
-                    0xff,0x35,0x00,0x4e,0x88,0x00,0xff,0x15,0x50,0xf6,0x7f,0x00,0x8b,0x45,0xf0,0x8b,
-                    0x15,0x44,0x4e,0x88,0x00,0xe9,0x35,0x75,0xcd,0xff,
+            # cameraSkipFix is baked into the torrent's WoW.exe, so we don't
+            # apply it. skillUiGateHijack and octowowUrlAllowlist below are
+            # baked in too, but the official launcher still applies these 2
+            # specific patches, so we mirror it in case the Octo devs drop them
+            # from WoW.exe again.
+            ("octowowUrlAllowlist", "bytes", None, [
+                (0x45ccd8, bytes([
+                    0x6f,0x63,0x74,0x6f,0x77,0x6f,0x77,0x2e,0x73,0x74,
+                    0x00,0x00,0x00,0x00,0x00,0x00,
                 ])),
             ]),
             ("skillUiGateHijack", "bytes", None, [
@@ -675,10 +1007,9 @@ class UpdateWorker:
         if not os.path.exists(exe):
             raise RuntimeError(f"WoW.exe not found in {self.out_dir}")
         self.log("\nApplying binary tweaks to WoW.exe…")
-        original_hash = sha1_file(exe)
-        self.log_q.put((f"__ORIGINAL_HASH__{original_hash}", ""))
-        with open(exe, "rb") as f:
-            buf = bytearray(f.read())
+        # Patch the pristine (unpatched) base rather than the on-disk exe, so a
+        # re-patch (tweak or language change) never stacks on patched bytes.
+        buf = bytearray(read_pristine_wow(self.out_dir))
         for label, kind, offset, value in self.build_tweaks(buf, tweaks):
             self.log(f"  {label}", "dim")
             if kind == "float":
@@ -694,41 +1025,82 @@ class UpdateWorker:
             f.write(buf)
         self.log("WoW.exe patched.", "ok")
 
-        patched_hash = sha1_file(exe)
-        self.log_q.put((f"__PATCHED_HASH__{patched_hash}", ""))
-
-    @staticmethod
-    def _nodes_contain_wow_exe(nodes) -> bool:
-        if nodes is None:
-            return True
-        for node in nodes:
-            if node.get("type") == "file" and node.get("name") == "WoW.exe":
-                return True
-            if node.get("type") == "dir":
-                if UpdateWorker._nodes_contain_wow_exe(node.get("files", [])):
-                    return True
-        return False
-
-    def run(self, diff_nodes=None):
+    def run(self):
+        # The selection is recomputed here from the live torrent so an
+        # interrupted sync always resumes against the current file set.
         try:
-            if diff_nodes is not None:
-                self.log("\nStarting client update…\n")
-                self.progress(0.05, "Downloading…")
-                for child in diff_nodes:
-                    self.traverse(child, [])
+            self.log("\nStarting client sync…\n", "acct")
+            self.progress(0.0, "Preparing…")
+            raw, files = fetch_torrent()
+            version = torrent_version(raw)
+
+            # aria2's saved control state pins a torrent revision and its
+            # completed pieces. When the torrent was re-rolled (new identity) or
+            # the folder changed, that state is stale — an 'info hash mismatch'
+            # error, or skipped re-downloads. Clear it and (for a new revision)
+            # drop wrong-sized files so they re-fetch clean.
+            cfg = load_config()
+            stale = (cfg.get("active_torrent_hash") != version or
+                     cfg.get("active_client_dir") != os.path.abspath(self.out_dir))
+            if stale:
+                clear_torrent_resume_state()
+                update_config(lambda c: c.update({
+                    "active_torrent_hash": version,
+                    "active_client_dir": os.path.abspath(self.out_dir)}))
+
+            # Config.wtf is user game config, not in the torrent — (re)write it
+            # on a reconcile (overwrite_config), or when missing.
+            cfg_wtf = os.path.join(self.out_dir, "WTF", "Config.wtf")
+            if self.overwrite_config or not os.path.exists(cfg_wtf):
+                write_config_wtf(self.out_dir)
+
+            # WoW.exe on disk is patched, so an integrity check always flags it
+            # and re-fetches its pieces over the network. Restore the cached
+            # pristine base first: the check then passes with no re-download when
+            # the client is unchanged (aria2 still repairs it if the torrent's
+            # WoW.exe genuinely changed). It's re-patched after the check.
+            wow_path = os.path.join(self.out_dir, "WoW.exe")
+            if (self.check_integrity and os.path.exists(PRISTINE_WOW_PATH)
+                    and os.path.exists(wow_path)):
+                shutil.copyfile(PRISTINE_WOW_PATH, wow_path)
+
+            # speech.MPQ is left unverified/un-updated when the user keeps a
+            # custom one (Settings → Ignore speech.mpq).
+            ignore_speech = bool(load_config().get("ignore_speech", False))
+            if self.check_integrity:
+                # Full piece-hash verify + repair of every non-mod file — aria2
+                # re-hashes them and re-fetches only the bad/missing pieces.
+                need, missing = torrent_all_selection(
+                    files, ignore_speech=ignore_speech), False
             else:
-                self.progress(0.02, "Fetching manifest…")
-                self.log("Fetching manifest.json…")
-                req = urllib.request.Request(
-                    f"{SERVER}/api/file/{DOWNLOAD_VERSION}/manifest.json",
-                    headers={"User-Agent": UA})
-                with secure_urlopen(req, timeout=DOWNLOAD_TIMEOUT) as r:
-                    manifest = json.load(r)
-                self.log("Manifest received.", "ok")
-                self.progress(0.05, "Downloading…")
-                self.log("\nStarting client update…\n")
-                for child in manifest["root"].get("files", []):
-                    self.traverse(child, [])
+                need, missing = torrent_selection(
+                    self.out_dir, files, drop_mismatched=stale,
+                    ignore_speech=ignore_speech)
+            # A file the user deleted leaves its pieces marked done in the
+            # control file, so aria2 skips it forever — clear resume state.
+            if missing:
+                clear_torrent_resume_state()
+            wow_downloaded = any(files[i - 1][0] == ["WoW.exe"] for i in need)
+
+            if need:
+                self.log(
+                    (f"Verifying {len(need)} file(s) via torrent…"
+                     if self.check_integrity
+                     else f"Syncing {len(need)} file(s) via torrent…"), "acct")
+
+                def _prog(p):
+                    label = f"{fmt_size(p['done'])} / {fmt_size(p['total'])}"
+                    if p["bps"]:
+                        label += "   •   " + fmt_speed(p["bps"])
+                    frac = p["done"] / p["total"] if p["total"] else 0.0
+                    self.progress(min(frac, 1.0), label)
+
+                run_aria2c(self.out_dir, select_files=need,
+                           check_integrity=self.check_integrity,
+                           on_progress=_prog,
+                           should_cancel=lambda: self._cancel, log_fn=self.log)
+            else:
+                self.log("All game files already present.", "dim")
 
             if self._cancel:
                 self.log("\nUpdate cancelled.", "err")
@@ -736,22 +1108,30 @@ class UpdateWorker:
                 self.log_q.put(("__ERROR__", ""))
                 return
 
+            self.progress(1.0, "Verifying…")
+            if not torrent_tree_intact(self.out_dir, files,
+                                       ignore_speech=ignore_speech):
+                self.log("\n✗  Download incomplete — click Update to finish.", "err")
+                self.log_q.put(("__ERROR__", ""))
+                return
+
             self.log("\nDownload complete.", "ok")
             remove_wdb(self.out_dir)
 
-            wow_exe_updated = self._nodes_contain_wow_exe(diff_nodes)
-            if wow_exe_updated:
-                self.progress(0.92, "Patching…")
+            # Drop legacy leftovers the current torrent no longer ships
+            for gone in prune_stale_client_files(self.out_dir, files):
+                self.log(f"Removed legacy file: {gone}", "dim")
+
+            # Cache the fresh pristine exe, then patch WoW.exe from that
+            # clean base — but only when the sync actually (re)downloaded it.
+            refresh_pristine_wow(self.out_dir)
+            if wow_downloaded:
+                self.progress(1.0, "Patching…")
                 self.patch_exe()
             else:
                 self.log("\nWoW.exe unchanged — skipping patch.", "dim")
-                self.progress(0.95, "")
 
-            # Config.wtf is user config — never written here. It's created when
-            # missing during verification and overwritten only on a folder
-            # change; a regular update must never touch it.
             self.progress(1.0, "")
-            save_cache(self._cache)
             self.log("\n✓  Everything is up to date!", "ok")
             client_ver = get_client_version(self.out_dir)
             if client_ver:
@@ -805,7 +1185,7 @@ def write_config_wtf(client_dir: str, tweaks: dict | None = None):
         "SmallCull": 0.01,
         "farClip": far_clip,
         "DistCull": 888.8,
-        "frillDensity": 48,
+        "frillDensity": 128,
         "unitDrawDist": 300,
         "weatherDensity": 3,
         "FoV": fov_rad,
@@ -917,7 +1297,7 @@ MODS_REGISTRY = [
         "id":          "VanillaFixes",
         "essential": True,
         "name":        "VanillaFixes",
-        "description": "Eliminates stuttering and animation lag. REQUIRED BY OTHER MODS.",
+        "description": "Eliminates stuttering and animation lag and enables mod loading. Required by other mods.",
         "repo_url":    "https://github.com/hannesmann/vanillafixes",
         "source": {
             "kind":          "github_release",
@@ -928,14 +1308,14 @@ MODS_REGISTRY = [
             "extract_map":   {"VfPatcher.dll": "VfPatcher.dll",
                               "VanillaFixes.exe": "VanillaFixes.exe"},
         },
-        "register_dll":    "VfPatcher.dll",
+        "register_dll":    None,   # the DLL loader itself
         "installed_files": ["VfPatcher.dll", "VanillaFixes.exe"],
     },
     {
         "id":          "ClassicAPI",
         "essential": True,
         "name":        "ClassicAPI",
-        "description": "Adds Lua API calls from later WoW versions. Required by addons.",
+        "description": "Expands the addon API with functions from later WoW versions.",
         "repo_url":    "https://github.com/brues-code/ClassicAPI",
         "source": {
             "kind":          "github_release",
@@ -949,9 +1329,26 @@ MODS_REGISTRY = [
         "installed_files": ["ClassicAPI.dll"],
     },
     {
+        "id":          "AuctionQueryThrottle",
+        "essential": True,
+        "name":        "AuctionQueryThrottle",
+        "description": "Removes the fixed 5-second wait between auction house searches.",
+        "repo_url":    "https://github.com/brues-code/AuctionQueryThrottle",
+        "source": {
+            "kind":          "github_release",
+            "owner":         "brues-code",
+            "repo":          "AuctionQueryThrottle",
+            "asset_pattern": "AuctionQueryThrottle.dll",
+            "prefer_no":     None,
+            "extract_map":   None,
+        },
+        "register_dll":    "AuctionQueryThrottle.dll",
+        "installed_files": ["AuctionQueryThrottle.dll"],
+    },
+    {
         "id":          "dxvk",
         "essential": True,
-        "name":        "dxvk",
+        "name":        "DXVK",
         "description": "Enables Vulkan-based rendering for improved performance.",
         "repo_url":    "https://github.com/doitsujin/dxvk",
         "source": {
@@ -963,14 +1360,14 @@ MODS_REGISTRY = [
             "extract_map":   {"dxvk-*/x32/d3d9.dll": "d3d9.dll"},
             "post_install":  ["write_dxvk_conf"],
         },
-        "register_dll":    "dxvk",
+        "register_dll":    None,   # d3d9.dll auto-loads as a DirectX proxy
         "installed_files": ["d3d9.dll", "dxvk.conf"],
     },
     {
         "id":          "nampower",
         "essential": True,
-        "name":        "nampower",
-        "description": "A client modification that minimizes your input lag if you have higher latency.",
+        "name":        "Nampower",
+        "description": "Reduces input lag and expands the addon API.",
         "repo_url":    "https://github.com/Emyrk/nampower",
         "source": {
             "kind":          "github_release",
@@ -987,7 +1384,7 @@ MODS_REGISTRY = [
         "id":          "SuperWoW",
         "essential": True,
         "name":        "SuperWoW",
-        "description": "Expands the client API with backported features from later WoW versions. Required by addons.",
+        "description": "Adds new features, including healing combat text, chat links of spells and recipes, and expands the addon API.",
         "repo_url":    "https://github.com/balakethelock/SuperWoW",
         "source": {
             "kind":          "github_release",
@@ -1007,8 +1404,8 @@ MODS_REGISTRY = [
     {
         "id":          "transmogfix",
         "essential": True,
-        "name":        "transmogfix",
-        "description": "A client-side fix that eliminates frame drops caused by the server transmogrification durability workaround.",
+        "name":        "TransmogFix",
+        "description": "Prevents frame drops on character death caused by the server-side transmogrification durability recalculation.",
         "repo_url":    "https://codeberg.org/MarcelineVQ/WeirdUtils",
         "source": {
             "kind":          "direct_file",
@@ -1023,7 +1420,7 @@ MODS_REGISTRY = [
         "id":          "UnitXP_SP3",
         "essential": True,
         "name":        "UnitXP_SP3",
-        "description": "Introduces modern quality-of-life features and improvements.",
+        "description": "Adds new features, including frame limiter, improved targeting, and anti-aliased combat text, and expands the addon API.",
         "repo_url":    "https://codeberg.org/konaka/UnitXP_SP3",
         "source": {
             "kind":          "codeberg_release",
@@ -1057,7 +1454,7 @@ MODS_REGISTRY = [
         "id":          "VanillaMultiMonitorFix",
         "essential": False,
         "name":        "VanillaMultiMonitorFix",
-        "description": "Fixes the client misbehaving on multi-monitor setups with differing resolutions.",
+        "description": "Fixes incorrect game resolution on multi-monitor setups with different resolutions. Set the desired monitor's index in VMMFix_preferred_monitor.txt; use ShowAllDisplayDevices.exe to find the index.",
         "repo_url":    "https://github.com/Mates1500/VanillaMultiMonitorFix",
         "source": {
             "kind":          "github_release",
@@ -1068,16 +1465,33 @@ MODS_REGISTRY = [
             "extract_map":   {"VanillaMultiMonitorFix.dll":
                               "VanillaMultiMonitorFix.dll",
                               "VMMFix_preferred_monitor.txt":
-                              "VMMFix_preferred_monitor.txt"},
+                              "VMMFix_preferred_monitor.txt",
+                              "ShowAllDisplayDevices.exe":
+                              "ShowAllDisplayDevices.exe"},
         },
         "register_dll":    "VanillaMultiMonitorFix.dll",
         "installed_files": ["VanillaMultiMonitorFix.dll",
-                            "VMMFix_preferred_monitor.txt"],
+                            "VMMFix_preferred_monitor.txt",
+                            "ShowAllDisplayDevices.exe"],
+    },
+    {
+        "id":          "no1600x1200",
+        "essential": False,
+        "name":        "No1600x1200",
+        "description": "Fixes incorrect game resolution when your monitor native resolution isn't detected or 1600x1200 is listed as the maximum.",
+        "repo_url":    "https://github.com/RetroCro/TurtleWoW-Mods",
+        "source": {
+            "kind":          "direct_file",
+            "url":           "https://raw.githubusercontent.com/RetroCro/TurtleWoW-Mods/refs/heads/main/Archive/DLL%20BACKUP/no1600x1200.dll",
+            "dest":          "no1600x1200.dll",
+            "pinned_version": "1.0",
+        },
+        "register_dll":    "no1600x1200.dll",
+        "installed_files": ["no1600x1200.dll"],
     },
 ]
 
 GITHUB_API = "https://api.github.com"
-MOD_UA     = f"OctoUpdater/{UPDATER_VERSION}"
 
 # Self-update: the updater checks its own GitHub releases once a day.
 UPDATER_REPO      = "rebasedkon/octo-updater"
@@ -1105,7 +1519,7 @@ def fetch_updater_latest_tag(force: bool = False) -> str | None:
     try:
         req = urllib.request.Request(
             f"{GITHUB_API}/repos/{UPDATER_REPO}/releases/latest",
-            headers={"User-Agent": MOD_UA})
+            headers={"User-Agent": UA})
         with secure_urlopen(req, timeout=10) as r:
             tag = json.load(r).get("tag_name")
     except Exception:
@@ -1129,7 +1543,7 @@ def updater_update_available(latest_tag: str) -> bool:
 def _codeberg_latest(owner: str, repo: str, raise_errors=False) -> dict | None:
     url = f"https://codeberg.org/api/v1/repos/{owner}/{repo}/releases?limit=10&pre-release=false"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": MOD_UA})
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
         with secure_urlopen(req, timeout=10) as r:
             releases = json.load(r)
         for rel in releases:
@@ -1148,11 +1562,13 @@ d3d9.maxFrameLatency = 1
 d3d9.clampNegativeLodBias = True
 # Disable logging for performance
 dxvk.logLevel = none
-# Triple buffering (needed for smooth G-SYNC + RTSS capping) can try lowering backbuffers to 2 if want
-dxvk.presentInterval = 0
-dxvk.numBackBuffers = 3
-# Use hardware mouse for responsiveness
-d3d9.cursor = 1
+# Overrides synchronization interval (Vsync) for presentation.
+# Setting this to 0 disables vertical synchronization entirely.
+# A positive value 'n' will enable Vsync and repeat the same
+# image n times, and a negative value will have no effect.
+#
+# Value -1 uses the application's setting
+d3d9.presentInterval = -1
 # VanillaFix handles DPI awareness; avoid double-scaling
 d3d9.dpiAware = False
 # Enable GPL if supported to reduce stuttering (NVIDIA 473.33+, AMD 24.6.1+)
@@ -1174,7 +1590,7 @@ def _write_dxvk_conf(client_dir: str):
 def _github_latest(owner: str, repo: str, raise_errors=False) -> dict | None:
     url = f"{GITHUB_API}/repos/{owner}/{repo}/releases/latest"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": MOD_UA})
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
         with secure_urlopen(req, timeout=10) as r:
             return json.load(r)
     except Exception as e:
@@ -1298,7 +1714,7 @@ def install_mod(mod: dict, client_dir: str, release: dict | None = None) -> list
                 f"No matching asset '{src['asset_pattern']}' in {mod['id']} release")
         log(f"  Downloading {asset['name']} ({asset['size']//1024} KB)...")
         req = urllib.request.Request(asset["browser_download_url"],
-                                     headers={"User-Agent": MOD_UA})
+                                     headers={"User-Agent": UA})
         with secure_urlopen(req, timeout=120,
                             allowed_hosts=ALLOWED_DOWNLOAD_HOSTS) as r:
             data = r.read()
@@ -1344,7 +1760,7 @@ def install_mod(mod: dict, client_dir: str, release: dict | None = None) -> list
                 f"No matching asset '{src['asset_pattern']}' in {mod['id']} release")
         log(f"  Downloading {asset['name']} ({asset['size']//1024} KB)...")
         req = urllib.request.Request(asset["browser_download_url"],
-                                     headers={"User-Agent": MOD_UA})
+                                     headers={"User-Agent": UA})
         with secure_urlopen(req, timeout=120,
                             allowed_hosts=ALLOWED_DOWNLOAD_HOSTS) as r:
             data = r.read()
@@ -1405,7 +1821,7 @@ def install_mod(mod: dict, client_dir: str, release: dict | None = None) -> list
 
     elif src["kind"] == "direct_tar":
         log(f"  Downloading {src['url'].split('/')[-1]}...")
-        req = urllib.request.Request(src["url"], headers={"User-Agent": MOD_UA})
+        req = urllib.request.Request(src["url"], headers={"User-Agent": UA})
         with secure_urlopen(req, timeout=120,
                             allowed_hosts=ALLOWED_DOWNLOAD_HOSTS) as r:
             data = r.read()
@@ -1431,7 +1847,7 @@ def install_mod(mod: dict, client_dir: str, release: dict | None = None) -> list
     elif src["kind"] == "direct_file":
         url = src["url"]
         log(f"  Downloading {url.rsplit('/', 1)[-1]}...")
-        req = urllib.request.Request(url, headers={"User-Agent": MOD_UA})
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
         with secure_urlopen(req, timeout=120,
                             allowed_hosts=ALLOWED_DOWNLOAD_HOSTS) as r:
             data = r.read()
@@ -1582,7 +1998,6 @@ ADDONS_VERIFY_TTL   = 300     # skip re-verify on tab switches within this
 # addons.json renames or drops it. Where the link differs from the catalog,
 # it's a deliberate fork preference.
 RECOMMENDED_ADDONS = {
-    "_LazyPig":             "https://github.com/Otari98/_LazyPig",
     "AtlasLoot":            "https://github.com/Otari98/AtlasLoot",
     "aux-addon":            "https://github.com/OldManAlpha/aux-addon",
     "BetterCharacterStats": "https://github.com/pepopo978/BetterCharacterStats",
@@ -1602,7 +2017,6 @@ RECOMMENDED_ADDONS = {
     "SUCC-bag":             "https://github.com/Otari98/SUCC-bag",
     "SuperAPI":             "https://github.com/balakethelock/SuperAPI",
     "SuperCleveRoidMacros": "https://github.com/brues-code/SuperCleveRoidMacros",
-    "T-RestedXP":           "https://github.com/whtmst/T-RestedXP",
     "Tmog":                 "https://github.com/Otari98/Tmog",
     "TrinketMenu":          "https://github.com/jrc13245/TrinketMenu",
     "TurtleCalendar":       "https://github.com/Wayoff333/TurtleCalendar",
@@ -2032,7 +2446,7 @@ def patch_pfui_default_profile(client_dir: str):
             '    f.Default = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")\n'
             "    f.Default:SetWidth(250)\n"
             "    f.Default:SetHeight(20)\n"
-            '    f.Default:SetPoint("BOTTOM", 0, 125)\n'
+            '    f.Default:SetPoint("BOTTOM", 0, 120)\n'
             "    f.Default:SetTextColor(1,1,1)\n"
             '    f.Default:SetText("Default (recommended)")\n'
             "    f.Default:SetScript(\"OnClick\", function()\n"
@@ -2063,11 +2477,12 @@ def patch_pfui_default_profile(client_dir: str):
 # ──────────────────────────────────────────────────────────────────────────────
 
 TWEAKS_DEFAULTS = {
+    "locale":          DEFAULT_LOCALE,
     "alwaysAutoLoot":  True,
     "nameplateRange":  41,
     "fieldOfView":     110,
     "farClip":         777,
-    "frillDistance":   70,
+    "frillDistance":   120,
     "cameraDistance":  50,
     "soundInBackground": True,
 }
@@ -2075,36 +2490,42 @@ TWEAKS_DEFAULTS = {
 TWEAKS_ITEMS = [
     (None, "GENERAL", "section", False, None, None, None, None, None),
 
-    ("alwaysAutoLoot",    "Always auto-loot",        "checkbox", True,  None,
-     "Reverses auto-loot behavior to always auto-loot.",
+    ("locale",            "Game Language",    "dropdown", False, None,
+     None,
      None, None, None),
 
-    ("nameplateRange",    "Nameplate range",          "number",   False, None,
-     "Distance at which nameplates are visible.",
+    ("alwaysAutoLoot",    "Auto Loot",        "checkbox", True,  None,
+     "Reverses the auto-loot behavior to always auto-loot.",
+     None, None, None),
+
+    ("nameplateRange",    "Nameplate Range",          "number",   False, None,
+     "Distance at which nameplates are visible. [0 - 41]",
      0, 41, 1),
 
     (None, "CAMERA", "section", False, None, None, None, None, None),
 
     ("fieldOfView",       "Field of View",            "number",   False, None,
-     "Recommended values for aspect ratios: [4:3 = 90] [16:9 = 110] [21:9 = 150] [32:9 = 180]",
+     "Recommended values by aspect ratio: [4:3 = 90] [16:9 = 110] [21:9 = 150] [32:9 = 180]",
      90, 180, 5),
 
-    ("farClip",           "Render distance",          "number",   False, None,
-     "Maximum render distance. May cause crashes. [Vanilla max: 777] [Tweaks max: 10000]",
+    ("cameraDistance",    "Camera Distance",          "number",   False, None,
+         "Maximum camera zoom-out distance. [50 - 100]",
+         50, 100, 1),
+
+    (None, "GRAPHICS", "section", False, None, None, None, None, None),
+
+    ("farClip",           "World Distance",          "number",   False, None,
+     "Terrain and world objects rendering distance. [100 - 10,000]",
      100, 10000, 1),
 
-    ("frillDistance",     "Ground clutter distance",  "number",   False, None,
-     "Ground clutter render distance. [Vanilla max: 70] [Tweaks max: 300]",
+    ("frillDistance",     "Ground Clutter Distance",  "number",   False, None,
+     "Grass and small rocks rendering distance. [0 - 300]",
      0, 300, 1),
-
-    ("cameraDistance",    "Camera distance",          "number",   False, None,
-     "Maximum camera (zoom out) distance. [Vanilla max: 50] [Tweaks max: 100]",
-     50, 100, 1),
 
     (None, "SOUND", "section", False, None, None, None, None, None),
 
-    ("soundInBackground", "Background sounds",        "checkbox", True,  None,
-     "Allows game sounds to play while the game is minimized.",
+    ("soundInBackground", "Sound in Background",        "checkbox", True,  None,
+     "Allows game sounds to play in the background.",
      None, None, None),
 ]
 
@@ -2222,13 +2643,13 @@ def _format_news_date(iso: str) -> str:
         return iso
 
 
-def fetch_news_items() -> list:
-    """news.json → [{id, title, date, body, url?, author?}, …]"""
-    req = urllib.request.Request(NEWS_URL, headers={"User-Agent": UA})
+def fetch_patch_notes() -> list:
+    """Patch-notes list → [{id, title, date, body, url?, author?}, …]"""
+    req = urllib.request.Request(PATCHNOTES_URL, headers={"User-Agent": UA})
     with secure_urlopen(req, timeout=NEWS_TIMEOUT) as r:
         data = json.load(r)
     items = data.get("items", [])
-    # news.json lists topics in forum order — show newest first (ISO dates
+    # The feed lists topics in forum order — show newest first (ISO dates
     # with a fixed offset sort correctly as strings).
     items.sort(key=lambda it: it.get("date", ""), reverse=True)
     return items
@@ -2305,22 +2726,47 @@ class SlimScrollbar(tk.Canvas):
 class OctoUpdaterApp(tk.Tk):
     def __init__(self):
         super().__init__()
+
+        # ── DPI scaling ────────────────────────────────────────────────────
+        # With awareness declared (see _enable_dpi_awareness) Windows reports
+        # the real DPI. Derive one scale factor from it and drive everything
+        # off it: fonts via Tk's own point→pixel scaling, and every hard-coded
+        # pixel value via self._px(). At 100% the factor is 1.0 and _px() is an
+        # exact identity, so nothing changes; only high-DPI diverges.
+        self._sc = max(1.0, self.winfo_fpixels("1i") / 96.0)
+        # tk scaling is pixels-per-point; DPI/72 == _sc * 96/72. Setting it
+        # explicitly keeps point-fonts growing by exactly _sc regardless of
+        # what Tk defaulted to.
+        self.tk.call("tk", "scaling", self._sc * 96.0 / 72.0)
+        # Bake the factor into the shared design constants once, up front, so
+        # the ~40 WIN_W/WIN_H/FOOT_H references downstream need no changes.
+        global WIN_W, WIN_H, FOOT_H
+        WIN_W  = self._px(WIN_W)
+        WIN_H  = self._px(WIN_H)
+        FOOT_H = self._px(FOOT_H)
+
         # Keep the window hidden until it's positioned and fully built, so it
         # never flashes at the default top-left corner before centering.
         self.withdraw()
 
+        # Move a pre-1.3 config/cache from beside the .exe into the per-user
+        # data dir before anything reads them, so first-run detection and
+        # load_config() below see the relocated files (see _relocate_legacy_data).
+        _relocate_legacy_data()
+
         # Detect first run before anything writes the config.
         self._first_run  = not os.path.exists(CONFIG_FILE)
-        # On first run Settings auto-opens with the folder auto-set to the
-        # current dir. If the user closes it without changing the folder or
-        # adding a Defender exclusion, recommend the exclusion once on close.
-        self._first_run_av_pending = self._first_run
-        # On first run we don't verify (fetch the manifest / touch Config.wtf)
-        # until the user closes Settings, so nothing is written to the default
-        # folder before they've picked their real game folder. A folder change
-        # supersedes this (it verifies the new folder right away).
-        self._first_run_verify_pending = self._first_run
+        # Set when the user adds a Defender exclusion via Settings; checked at
+        # the next reconcile to skip the auto-prompt (so a manual add isn't
+        # double-prompted), then reset — so each folder change offers one unless
+        # the user just added it themselves.
+        self._av_excluded = False
         self._cfg        = load_config()
+        # Pending reconcile mode (None = none): _offer_reconcile surfaces the
+        # Update button and the Update the user clicks runs an integrity pass
+        # instead of a routine size-based sync. "full" also writes a fresh
+        # Config.wtf (folder change / first run); "keep-config" leaves Config.wtf.
+        self._pending_reconcile = self._cfg.get("pending_reconcile") or None
         self._running    = False
         # True only after a verify/update confirmed the client files are up
         # to date. PLAY is gated on this AND on no mod being in an error state.
@@ -2328,7 +2774,6 @@ class OctoUpdaterApp(tk.Tk):
         self._worker: UpdateWorker | None = None
         self._log_q:  queue.Queue = queue.Queue()
         self._prog_q: queue.Queue = queue.Queue()
-        self._diff_nodes = None
         # Session log lives in memory; the "Show logs" window renders it.
         self._log_buffer: list = []
         self._logwin = None
@@ -2340,12 +2785,11 @@ class OctoUpdaterApp(tk.Tk):
         self._default_mods_install_started = False
         self._default_addons_install_started = False
 
-        # Game folder path — shared by the Settings modal; changing it fires
-        # the folder-change reset via the trace.
-        self._path_var = tk.StringVar(
-            value=os.path.normpath(self._cfg.get("out_dir", DEFAULT_OUT_DIR)))
-        self._last_path_val = os.path.normpath(self._path_var.get().strip())
-        self._path_var.trace_add("write", self._on_path_changed)
+        # Game folder path — shared by the Settings modal. A change takes
+        # effect only once Settings is closed (see _close_settings), so no
+        # live trace fires mid-edit.
+        self._game_path = tk.StringVar(
+            value=os.path.normpath(self._cfg.get("out_dir", DEFAULT_GAME_DIR)))
 
         # Count of mods with an update available — shown as a badge on the
         # MODS nav tab.
@@ -2359,6 +2803,8 @@ class OctoUpdaterApp(tk.Tk):
         self._addons_installing = False
         self._addons_verified_ts = 0.0
         self._addon_updates_count = 0
+        self._mpq_updates_count = 0
+        self._mpq_busy = None
         # {folder: {"error": msg, "git": url}} for failed installs/updates —
         # survives the post-operation rescan so rows can show what went wrong.
         self._addon_errors = {}
@@ -2366,8 +2812,8 @@ class OctoUpdaterApp(tk.Tk):
 
         # News feed cache (featured post and announcements cached separately)
         self._feat_ts    = 0.0
-        self._news_ts    = 0.0
-        self._news_items = None
+        self._patch_ts    = 0.0
+        self._patch_items = None
         self._featured   = None
 
         # Scrollable list canvases that respond to the mouse wheel whenever
@@ -2389,7 +2835,7 @@ class OctoUpdaterApp(tk.Tk):
 
         self._build()
 
-        out_dir = self._cfg.get("out_dir", DEFAULT_OUT_DIR)
+        out_dir = self._cfg.get("out_dir", DEFAULT_GAME_DIR)
         if not os.path.exists(out_dir):
             def _wipe(c):
                 c.pop("mods", None)
@@ -2401,9 +2847,21 @@ class OctoUpdaterApp(tk.Tk):
             self._client_ver_var.set(live_ver)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll()
+        # Run any one-time migrations for a freshly-installed updater version
+        # (and stamp octo_updater_version) before verifying. It runs
+        # synchronously, so a v1.3 re-patch is settled before verify reads
+        # WoW.exe, and the normal verify below still runs — an upgrading user
+        # never misses a pending client update.
+        self._new_version_installed()
         # On first run, defer verification until Settings is closed (see
-        # _close_settings / _first_run_verify_pending).
-        if not self._first_run:
+        # _close_settings). If a reconcile was offered on a previous run but
+        # never applied, restore the Update button instead of a routine verify.
+        # Otherwise run the routine launch verify.
+        if self._first_run:
+            pass
+        elif self._pending_reconcile:
+            self.after(300, self._offer_reconcile)
+        else:
             self.after(300, self._start_verify)
         self.after(600, self._load_news)
         # Check mod updates at launch too — but only once mods have actually
@@ -2418,6 +2876,10 @@ class OctoUpdaterApp(tk.Tk):
         # folder — never on a first run / fresh folder.
         if self._cfg.get("addons") is not None:
             self.after(1500, self._addons_verify)
+        # MPQ patches: check installed known patches for updates at launch so
+        # the tab badge shows without opening the tab (no-op if none installed).
+        if not self._first_run and self._game_path.get().strip():
+            self.after(1700, self._mpq_check)
         # Daily self-update check (cached), last so it never delays the rest.
         self.after(2000, lambda: threading.Thread(
             target=self._check_updater_update, daemon=True).start())
@@ -2427,6 +2889,14 @@ class OctoUpdaterApp(tk.Tk):
 
         # Everything is positioned and built — reveal the centered window.
         self.deiconify()
+
+    def _px(self, *vals):
+        """Scale design pixels (authored at 96 DPI) to the current DPI. Returns
+        an int for one arg, a tuple for several — handy for canvas coordinate
+        lists. Exact identity when the scale factor is 1.0 (100% scaling)."""
+        if len(vals) == 1:
+            return round(vals[0] * self._sc)
+        return tuple(round(v * self._sc) for v in vals)
 
     # ── build ─────────────────────────────────────────────────────────────────
 
@@ -2438,6 +2908,9 @@ class OctoUpdaterApp(tk.Tk):
             self.withdraw()
         except Exception:
             pass
+        # A download's aria2c child isn't a daemon thread — kill it explicitly
+        # so it can't keep syncing headless after the window is gone.
+        stop_aria2c()
         self.quit()
 
     def _add_tooltip(self, widget, text: str):
@@ -2447,15 +2920,15 @@ class OctoUpdaterApp(tk.Tk):
         def show(_e=None):
             if state["win"] is not None:
                 return
-            x = widget.winfo_rootx() + 12
-            y = widget.winfo_rooty() + widget.winfo_height() + 4
+            x = widget.winfo_rootx() + self._px(12)
+            y = widget.winfo_rooty() + widget.winfo_height() + self._px(4)
             tw = tk.Toplevel(self)
             tw.wm_overrideredirect(True)
             tw.wm_geometry(f"+{x}+{y}")
             tk.Label(tw, text=text, font=("Segoe UI", 9),
                      fg=C_TEXT, bg="#0f0b16",
                      highlightthickness=1, highlightbackground=C_PANEL_BDR,
-                     padx=6, pady=2).pack()
+                     padx=self._px(6), pady=self._px(2)).pack()
             state["win"] = tw
 
         def hide(_e=None):
@@ -2495,10 +2968,10 @@ class OctoUpdaterApp(tk.Tk):
         cv = self._hdr_canvas
         tag = f"nav_{tab}"
         cv.delete(tag)
-        cx, cy = self._nav_pos[tab], 54
+        cx, cy = self._nav_pos[tab], self._px(54)
         font = ("Segoe UI", 11, "bold")
         if tab == self._active_tab:
-            for r, col in ((2, "#42340f"), (1, "#7a5c1d")):
+            for r, col in ((self._px(2), "#42340f"), (self._px(1), "#7a5c1d")):
                 for dx, dy in ((-r, 0), (r, 0), (0, -r), (0, r),
                                (-r, -r), (r, -r), (-r, r), (r, r)):
                     cv.create_text(cx + dx, cy + dy, text=tab,
@@ -2515,15 +2988,18 @@ class OctoUpdaterApp(tk.Tk):
             count = self._mod_updates_count
         elif tab == "ADDONS":
             count = self._addon_updates_count
+        elif tab == "MPQ":
+            count = self._mpq_updates_count
         if count:
-            bx = cx + self._nav_text_w[tab] // 2 + 11
-            by = cy - 11
+            bx = cx + self._nav_text_w[tab] // 2 + self._px(11)
+            by = cy - self._px(11)
             # Canvas oval, not a ● glyph: the oval gives exact geometric
             # control so the number always centers, consistently across OSes.
             # (A filled-circle glyph antialiases nicely but its disk isn't
             # centered in the glyph box — by a font-specific amount — so the
             # number drifts off-centre and can't be corrected reliably.)
-            cv.create_oval(bx - 8, by - 8, bx + 8, by + 8,
+            r8 = self._px(8)
+            cv.create_oval(bx - r8, by - r8, bx + r8, by + r8,
                            fill=C_GOLD, outline="", tags=tag)
             cv.create_text(bx, by, text=str(count),
                            font=("Segoe UI", 8, "bold"),
@@ -2537,8 +3013,8 @@ class OctoUpdaterApp(tk.Tk):
         self._draw_nav_tab(prev)
         self._draw_nav_tab(tab)
 
-        PANEL_TOP = 119
-        PANEL_H   = WIN_H - PANEL_TOP - FOOT_H - 10
+        PANEL_TOP = self._px(119)
+        PANEL_H   = WIN_H - PANEL_TOP - FOOT_H - self._px(10)
 
         # Panels stay mapped and stacked; switching tabs only raises the
         # active one. place_forget()/place() would unmap and remap the whole
@@ -2547,11 +3023,12 @@ class OctoUpdaterApp(tk.Tk):
         panels = {"NEWS":   self._news_panel,
                   "TWEAKS": self._tweaks_panel_frame,
                   "ADDONS": self._addons_panel_frame,
-                  "MODS":   self._mods_panel_frame}
+                  "MODS":   self._mods_panel_frame,
+                  "MPQ":    self._mpq_panel_frame}
         target = panels.get(tab, self._news_panel)
         if not target.winfo_ismapped():
-            target.place(x=40, y=PANEL_TOP,
-                         width=WIN_W - 80, height=PANEL_H)
+            target.place(x=self._px(40), y=PANEL_TOP,
+                         width=WIN_W - self._px(80), height=PANEL_H)
         target.tkraise()
         self._active_panel = target
 
@@ -2561,6 +3038,8 @@ class OctoUpdaterApp(tk.Tk):
             self._refresh_tweaks_panel()
         elif tab == "ADDONS":
             self._addons_verify()
+        elif tab == "MPQ":
+            self._mpq_check()
         else:
             self._load_news()
 
@@ -2576,9 +3055,9 @@ class OctoUpdaterApp(tk.Tk):
 
     def _draw_bg(self):
         c = self._bg_canvas
-        bloom_cx, bloom_cy = WIN_W - 80, 80
+        bloom_cx, bloom_cy = WIN_W - self._px(80), self._px(80)
         for i in range(40, 0, -1):
-            r  = i * 9
+            r  = self._px(i * 9)
             alpha_frac = (40 - i) / 40
             r_val = int(0x12 + alpha_frac * (0x2e - 0x12))
             g_val = int(0x0e + alpha_frac * (0x18 - 0x0e))
@@ -2588,10 +3067,11 @@ class OctoUpdaterApp(tk.Tk):
                           bloom_cx + r, bloom_cy + r,
                           fill=col, outline="")
 
-        c.create_line(0, WIN_H - 1, WIN_W, WIN_H - 1, fill=C_PANEL_BDR)
+        c.create_line(0, WIN_H - self._px(1), WIN_W, WIN_H - self._px(1),
+                      fill=C_PANEL_BDR)
 
     def _build_header(self):
-        HDR_H = 108
+        HDR_H = self._px(108)
 
         hdr = tk.Canvas(self, width=WIN_W, height=HDR_H,
                         bg=C_BG, highlightthickness=0)
@@ -2601,9 +3081,9 @@ class OctoUpdaterApp(tk.Tk):
         # Same corner bloom as the main background (identical coordinates
         # and colors) so the header blends seamlessly with the body instead
         # of sitting as a darker separated band.
-        bloom_cx, bloom_cy = WIN_W - 80, 80
+        bloom_cx, bloom_cy = WIN_W - self._px(80), self._px(80)
         for i in range(40, 0, -1):
-            r = i * 9
+            r = self._px(i * 9)
             alpha_frac = (40 - i) / 40
             r_val = int(0x12 + alpha_frac * (0x2e - 0x12))
             g_val = int(0x0e + alpha_frac * (0x18 - 0x0e))
@@ -2615,35 +3095,38 @@ class OctoUpdaterApp(tk.Tk):
 
         import tkinter.font as tkfont
 
-        self._logo_y = HDR_H // 2 - 6
+        self._logo_y = HDR_H // 2 - self._px(6)
         self._draw_logo()
 
+        # Point-sized font: Tk scales it by tk-scaling, so measure() below
+        # already returns device pixels at the current DPI.
         nav_font = tkfont.Font(family="Segoe UI", size=11, weight="bold")
-        tabs = ["NEWS", "TWEAKS", "ADDONS", "MODS"]
+        tabs = ["NEWS", "TWEAKS", "ADDONS", "MODS", "MPQ"]
         self._active_tab  = "NEWS"
         self._nav_pos     = {}
         self._nav_text_w  = {}
         self._hdr_regions = {}
-        x = 240
+        x = self._px(240)
         for tab in tabs:
-            w = nav_font.measure(tab) + 36
+            w = nav_font.measure(tab) + self._px(36)
             self._nav_pos[tab]     = x + w // 2
             self._nav_text_w[tab]  = nav_font.measure(tab)
             self._hdr_regions[tab] = (x, 0, x + w, HDR_H)
             x += w
             self._draw_nav_tab(tab)
 
-        self._hdr_regions["gear"] = (WIN_W - 36, 2, WIN_W - 2, 34)
+        self._hdr_regions["gear"] = (WIN_W - self._px(36), self._px(2),
+                                     WIN_W - self._px(2), self._px(34))
         self._draw_gear()
 
         # The wordmark is a clickable header element too (opens the repo).
         lb = hdr.bbox("logo")
         if lb:
-            self._hdr_regions["logo"] = (lb[0] - 4, lb[1] - 4,
-                                         lb[2] + 6, lb[3] + 4)
+            self._hdr_regions["logo"] = (lb[0] - self._px(4), lb[1] - self._px(4),
+                                         lb[2] + self._px(6), lb[3] + self._px(4))
             self._logo_cx = (lb[0] + lb[2]) // 2
         else:
-            self._logo_cx = 127
+            self._logo_cx = self._px(127)
         # "Update available!" label under the wordmark, shown once the daily
         # self-update check finds a newer release.
         self._update_available = False
@@ -2662,6 +3145,8 @@ class OctoUpdaterApp(tk.Tk):
             value=bool(self._cfg.get("auto_install_mods", True)))
         self._auto_addons_var = tk.BooleanVar(
             value=bool(self._cfg.get("auto_install_addons", True)))
+        self._ignore_speech_var = tk.BooleanVar(
+            value=bool(self._cfg.get("ignore_speech", False)))
         # Deferred "install missing" pending from turning an auto-install
         # option on in Settings — applied on close (see _close_settings).
         self._auto_mods_retrigger = False
@@ -2670,7 +3155,7 @@ class OctoUpdaterApp(tk.Tk):
     def _draw_logo(self, hover: bool = False):
         cv = self._hdr_canvas
         cv.delete("logo")
-        cv.create_text(24, self._logo_y, text="Octo Updater",
+        cv.create_text(self._px(24), self._logo_y, text="Octo Updater",
                        font=("Segoe UI", 24, "bold"),
                        fill="#b478d9" if hover else "#9a5cbf",
                        anchor="w", tags="logo")
@@ -2681,20 +3166,21 @@ class OctoUpdaterApp(tk.Tk):
         self._hdr_regions.pop("update", None)
         if not self._update_available:
             return
-        cv.create_text(self._logo_cx, self._logo_y + 26,
+        cv.create_text(self._logo_cx, self._logo_y + self._px(26),
                        text="Update available!",
                        font=("Segoe UI", 10, "bold"),
                        fill=C_GOLD_LT if hover else C_GOLD,
                        anchor="n", tags="upd_label")
         lb = cv.bbox("upd_label")
         if lb:
-            self._hdr_regions["update"] = (lb[0] - 4, lb[1] - 2,
-                                           lb[2] + 4, lb[3] + 2)
+            self._hdr_regions["update"] = (lb[0] - self._px(4), lb[1] - self._px(2),
+                                           lb[2] + self._px(4), lb[3] + self._px(2))
 
     def _draw_gear(self, hover: bool = False):
         cv = self._hdr_canvas
         cv.delete("gear_icon")
-        cv.create_text(WIN_W - 10, 8, text="⚙", font=("Segoe UI", 13),
+        cv.create_text(WIN_W - self._px(10), self._px(8), text="⚙",
+                       font=("Segoe UI", 13),
                        fill=C_GOLD if hover else C_TEXT_DIM,
                        anchor="ne", tags="gear_icon")
 
@@ -2745,49 +3231,50 @@ class OctoUpdaterApp(tk.Tk):
             self.after(0, show)
 
     def _build_panel(self):
-        PANEL_TOP  = 109
+        PANEL_TOP  = self._px(109)
         PANEL_BOT  = FOOT_H
         PANEL_H    = WIN_H - PANEL_TOP - PANEL_BOT
-        PAD        = 40
+        PAD        = self._px(40)
 
         panel = tk.Frame(self, bg=C_BG)
-        panel.place(x=PAD, y=PANEL_TOP + 10,
+        panel.place(x=PAD, y=PANEL_TOP + self._px(10),
                     width=WIN_W - PAD * 2,
-                    height=PANEL_H - 20)
+                    height=PANEL_H - self._px(20))
         self._news_panel = panel
         self._active_panel = panel   # NEWS is the initial tab
 
         inner_w = WIN_W - PAD * 2
         self._news_left_w  = int(inner_w * 0.60)
-        self._news_right_w = inner_w - self._news_left_w - 12
+        self._news_right_w = inner_w - self._news_left_w - self._px(12)
 
-        # Featured forum post — parchment panel (left)
+        # Latest announcement — parchment panel (left)
         feat = tk.Frame(panel, bg=C_PARCH)
         feat.place(x=0, y=0, width=self._news_left_w, relheight=1.0)
         self._feat_frame = feat
 
-        # Announcements list (right)
+        # Patch-notes list (right)
         ann = tk.Frame(panel, bg=C_PANEL,
                        highlightthickness=1,
                        highlightbackground=C_PANEL_BDR)
-        ann.place(x=self._news_left_w + 12, y=0,
+        ann.place(x=self._news_left_w + self._px(12), y=0,
                   width=self._news_right_w, relheight=1.0)
-        self._ann_frame = ann
+        self._patch_frame = ann
 
         self._render_featured(None, loading=True)
-        self._render_announcements(None, loading=True)
+        self._render_patch_notes(None, loading=True)
 
         self._log_line("Octo Updater  v" + UPDATER_VERSION + "\n", "acct")
         self._log_line("─" * 60 + "\n", "dim")
         self._build_mods_panel()
         self._build_tweaks_panel()
         self._build_addons_panel()
+        self._build_mpq_panel()
 
     # ── news panel ───────────────────────────────────────────────────────────
 
     def _load_news(self, force=False):
         self._load_featured(force)
-        self._load_announcements(force)
+        self._load_patch_notes(force)
 
     def _load_featured(self, force=False):
         now = time.time()
@@ -2810,24 +3297,24 @@ class OctoUpdaterApp(tk.Tk):
             self.after(0, apply)
         threading.Thread(target=worker, daemon=True).start()
 
-    def _load_announcements(self, force=False):
+    def _load_patch_notes(self, force=False):
         now = time.time()
-        if (not force and self._news_items is not None
-                and (now - self._news_ts) < NEWS_CACHE_TTL):
+        if (not force and self._patch_items is not None
+                and (now - self._patch_ts) < NEWS_CACHE_TTL):
             return
-        self._render_announcements(None, loading=True)
+        self._render_patch_notes(None, loading=True)
 
         def worker():
             items, err = None, ""
             try:
-                items = fetch_news_items()
+                items = fetch_patch_notes()
             except Exception:
                 err = "Couldn't reach the news feed."
 
             def apply():
-                self._news_ts    = time.time()
-                self._news_items = items
-                self._render_announcements(items, error=err)
+                self._patch_ts    = time.time()
+                self._patch_items = items
+                self._render_patch_notes(items, error=err)
             self.after(0, apply)
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2843,12 +3330,12 @@ class OctoUpdaterApp(tk.Tk):
         band = tk.Frame(f, bg=C_PARCH_BAND)
         band.pack(fill="x")
         hdr = tk.Frame(band, bg=C_PARCH_BAND)
-        hdr.pack(fill="x", padx=20, pady=(16, 12))
+        hdr.pack(fill="x", padx=self._px(20), pady=(self._px(16), self._px(12)))
         tk.Label(hdr,
                  text=title.upper() if title else "NEWS",
                  font=("Segoe UI", 13, "bold"),
                  fg=C_PARCH_TITLE, bg=C_PARCH_BAND,
-                 wraplength=self._news_left_w - 100,
+                 wraplength=self._news_left_w - self._px(100),
                  justify="left", anchor="w").pack(side="left",
                                                   fill="x", expand=True)
         rf = tk.Label(hdr, text="⟳", font=("Segoe UI", 14),
@@ -2862,7 +3349,8 @@ class OctoUpdaterApp(tk.Tk):
             msg = error or ("Loading…" if loading
                             else "No news yet — check back later.")
             tk.Label(f, text=msg, font=("Segoe UI", 10),
-                     fg=C_PARCH_DIM, bg=C_PARCH).pack(padx=20, pady=16,
+                     fg=C_PARCH_DIM, bg=C_PARCH).pack(padx=self._px(20),
+                                                      pady=self._px(16),
                                                       anchor="w")
             return
 
@@ -2875,8 +3363,8 @@ class OctoUpdaterApp(tk.Tk):
         tk.Label(bl, text=" · ".join(byline),
                  font=("Segoe UI", 10, "italic"),
                  fg=C_PARCH_DIM, bg=C_PARCH_BAND,
-                 anchor="w").pack(fill="x", padx=20, pady=10)
-        tk.Frame(f, bg=C_PARCH_LINE, height=1).pack(fill="x")
+                 anchor="w").pack(fill="x", padx=self._px(20), pady=self._px(10))
+        tk.Frame(f, bg=C_PARCH_LINE, height=self._px(1)).pack(fill="x")
 
         # Pack the link first with side="bottom" so it's always reserved its
         # space; the body Text (which defaults to 24 lines tall) then fills
@@ -2886,7 +3374,8 @@ class OctoUpdaterApp(tk.Tk):
                             font=("Segoe UI", 11),
                             fg=C_PARCH_LINK, bg=C_PARCH,
                             cursor="hand2", anchor="w")
-            link.pack(side="bottom", fill="x", padx=20, pady=(4, 16))
+            link.pack(side="bottom", fill="x", padx=self._px(20),
+                      pady=(self._px(4), self._px(16)))
             link.bind("<Button-1>",
                       lambda e, u=post["url"]: self._open_url(u))
             link.bind("<Enter>", lambda e: link.configure(fg=C_PARCH_TITLE))
@@ -2895,76 +3384,83 @@ class OctoUpdaterApp(tk.Tk):
         body = _strip_html(post.get("html", ""))
         txt = tk.Text(f, bg=C_PARCH, fg=C_PARCH_TEXT, relief="flat",
                       font=("Segoe UI", 11), wrap="word", height=1,
-                      padx=2, pady=8, spacing2=4, spacing3=4,
+                      padx=self._px(2), pady=self._px(8),
+                      spacing2=self._px(4), spacing3=self._px(4),
                       highlightthickness=0, cursor="arrow")
         txt.insert("1.0", body)
         txt.configure(state="disabled")
-        txt.pack(fill="both", expand=True, padx=20, pady=(8, 2))
+        txt.pack(fill="both", expand=True, padx=self._px(20),
+                 pady=(self._px(8), self._px(2)))
 
-    def _render_announcements(self, items, loading=False, error=""):
-        f = self._ann_frame
+    def _render_patch_notes(self, items, loading=False, error=""):
+        f = self._patch_frame
         for w in f.winfo_children():
             w.destroy()
 
         hdr = tk.Frame(f, bg=C_PANEL)
-        hdr.pack(fill="x", padx=14, pady=(16, 10))
-        tk.Label(hdr, text="ANNOUNCEMENTS",
+        hdr.pack(fill="x", padx=self._px(14), pady=(self._px(16), self._px(10)))
+        tk.Label(hdr, text="PATCH NOTES",
                  font=("Segoe UI", 12, "bold"),
                  fg=C_GOLD, bg=C_PANEL).pack(side="left")
         rf = tk.Label(hdr, text="⟳", font=("Segoe UI", 14),
                       fg=C_TEXT_DIM, bg=C_PANEL, cursor="hand2")
         rf.pack(side="right")
-        rf.bind("<Button-1>", lambda e: self._load_announcements(force=True))
+        rf.bind("<Button-1>", lambda e: self._load_patch_notes(force=True))
         rf.bind("<Enter>",    lambda e: rf.configure(fg=C_GOLD))
         rf.bind("<Leave>",    lambda e: rf.configure(fg=C_TEXT_DIM))
 
-        tk.Frame(f, bg=C_DIVIDER, height=1).pack(fill="x", padx=14)
+        tk.Frame(f, bg=C_DIVIDER, height=self._px(1)).pack(
+            fill="x", padx=self._px(14))
 
         if items is None or error:
             msg = error or ("Loading…" if loading
                             else "Couldn't reach the news feed.")
             tk.Label(f, text=msg, font=FONT_BODY,
-                     fg=C_TEXT_DIM, bg=C_PANEL).pack(padx=14, pady=12,
+                     fg=C_TEXT_DIM, bg=C_PANEL).pack(padx=self._px(14),
+                                                     pady=self._px(12),
                                                      anchor="w")
             return
         if not items:
             tk.Label(f, text="No news yet — check back later.",
                      font=FONT_BODY, fg=C_TEXT_DIM,
-                     bg=C_PANEL).pack(padx=14, pady=12, anchor="w")
+                     bg=C_PANEL).pack(padx=self._px(14), pady=self._px(12),
+                                      anchor="w")
             return
 
         list_frame = tk.Frame(f, bg=C_PANEL)
-        list_frame.pack(fill="both", expand=True, padx=(14, 4), pady=(0, 10))
+        list_frame.pack(fill="both", expand=True, padx=(self._px(14), self._px(4)),
+                        pady=(0, self._px(10)))
         canvas = tk.Canvas(list_frame, bg=C_PANEL, highlightthickness=0)
-        sb = SlimScrollbar(list_frame, command=canvas.yview, bg=C_PANEL)
+        sb = SlimScrollbar(list_frame, command=canvas.yview, bg=C_PANEL,
+                           width=self._px(10))
         self._wheel_canvases.append(canvas)
         inner = tk.Frame(canvas, bg=C_PANEL)
         inner.bind("<Configure>",
                    lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.create_window((0, 0), window=inner, anchor="nw",
-                             width=self._news_right_w - 40)
+                             width=self._news_right_w - self._px(40))
         canvas.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
 
-        wrap_w = self._news_right_w - 50
+        wrap_w = self._news_right_w - self._px(50)
         for item in items:
             top = tk.Frame(inner, bg=C_PANEL)
-            top.pack(fill="x", pady=(12, 0))
+            top.pack(fill="x", pady=(self._px(12), 0))
             tk.Label(top, text=_format_news_date(item.get("date", "")),
                      font=("Segoe UI", 9), fg=C_TEXT_DIM,
                      bg=C_PANEL).pack(side="right", anchor="n")
             tk.Label(top, text=item.get("title", ""),
                      font=("Segoe UI", 11, "bold"),
                      fg=C_GOLD, bg=C_PANEL,
-                     wraplength=wrap_w - 85, justify="left",
+                     wraplength=wrap_w - self._px(85), justify="left",
                      anchor="w").pack(side="left", fill="x", expand=True)
 
             if item.get("author"):
                 tk.Label(inner, text=f"by {item['author']}",
                          font=("Segoe UI", 10, "italic"),
                          fg=C_TEXT_DIM, bg=C_PANEL,
-                         anchor="w").pack(fill="x", pady=(2, 0))
+                         anchor="w").pack(fill="x", pady=(self._px(2), 0))
 
             body = item.get("body", "").strip()
             if len(body) > 260:
@@ -2973,21 +3469,21 @@ class OctoUpdaterApp(tk.Tk):
                 tk.Label(inner, text=body, font=("Segoe UI", 10),
                          fg=C_TEXT, bg=C_PANEL,
                          wraplength=wrap_w, justify="left",
-                         anchor="w").pack(fill="x", pady=(5, 0))
+                         anchor="w").pack(fill="x", pady=(self._px(5), 0))
 
             if item.get("url"):
                 lnk = tk.Label(inner, text="⧉ Read more",
                                font=("Segoe UI", 10),
                                fg=C_GOLD, bg=C_PANEL,
                                cursor="hand2", anchor="w")
-                lnk.pack(fill="x", pady=(5, 0))
+                lnk.pack(fill="x", pady=(self._px(5), 0))
                 lnk.bind("<Button-1>",
                          lambda e, u=item["url"]: self._open_url(u))
                 lnk.bind("<Enter>", lambda e, w=lnk: w.configure(fg=C_GOLD_LT))
                 lnk.bind("<Leave>", lambda e, w=lnk: w.configure(fg=C_GOLD))
 
-            tk.Frame(inner, bg=C_DIVIDER, height=1).pack(fill="x",
-                                                         pady=(12, 0))
+            tk.Frame(inner, bg=C_DIVIDER, height=self._px(1)).pack(
+                fill="x", pady=(self._px(12), 0))
 
     # ── tweaks panel ─────────────────────────────────────────────────────────────
 
@@ -3001,24 +3497,20 @@ class OctoUpdaterApp(tk.Tk):
         self._tweaks_inner = tk.Frame(outer, bg=C_PANEL)
         self._tweaks_inner.pack(fill="both", expand=True)
 
-        tk.Frame(outer, bg=C_DIVIDER, height=1).pack(fill="x", padx=16)
-        foot = tk.Frame(outer, bg=C_PANEL)
-        foot.pack(fill="x", padx=16, pady=(6, 10))
+        bar = tk.Frame(outer, bg=C_PANEL)
+        bar.place(relx=1.0, x=-self._px(16), y=self._px(3), anchor="ne")
 
-        # Packed on demand by _refresh_tweaks_buttons(): Apply appears only
-        # when UI values differ from the saved config, Reset only when the
-        # saved values differ from the defaults.
-        apl = tk.Label(foot, text="Apply", font=("Segoe UI", 11),
+        apl = tk.Label(bar, text="Apply", font=("Segoe UI", 11),
                        fg=C_TEXT, bg=C_PANEL_BDR, cursor="hand2",
-                       padx=16, pady=4)
+                       padx=self._px(16), pady=self._px(4))
         apl.bind("<Button-1>", lambda e: self._apply_tweaks())
         apl.bind("<Enter>",    lambda e: apl.configure(bg=C_GOLD, fg="#000"))
         apl.bind("<Leave>",    lambda e: apl.configure(bg=C_PANEL_BDR, fg=C_TEXT))
         self._tweaks_apply_btn = apl
 
-        rst = tk.Label(foot, text="Reset", font=("Segoe UI", 11),
+        rst = tk.Label(bar, text="Reset", font=("Segoe UI", 11),
                        fg=C_TEXT, bg=C_PANEL_BDR, cursor="hand2",
-                       padx=16, pady=4)
+                       padx=self._px(16), pady=self._px(4))
         rst.bind("<Button-1>", lambda e: self._reset_tweaks())
         rst.bind("<Enter>",    lambda e: rst.configure(bg=C_GOLD, fg="#000"))
         rst.bind("<Leave>",    lambda e: rst.configure(bg=C_PANEL_BDR, fg=C_TEXT))
@@ -3036,20 +3528,21 @@ class OctoUpdaterApp(tk.Tk):
         self._tweak_vars    = {}
 
         values = load_tweaks_config()
-        PAD_X  = 16
+        PAD_X  = self._px(16)
 
         for (tid, label, kind, recommended, _, desc, mn, mx, step) in TWEAKS_ITEMS:
             if kind == "section":
                 tk.Label(self._tweaks_inner, text=label,
                          font=("Segoe UI", 11, "bold"),
                          fg=C_GOLD, bg=C_PANEL,
-                         anchor="w").pack(fill="x", padx=PAD_X, pady=(10, 2))
-                tk.Frame(self._tweaks_inner, bg=C_DIVIDER, height=1).pack(
-                    fill="x", padx=PAD_X, pady=(0, 4))
+                         anchor="w").pack(fill="x", padx=PAD_X,
+                                          pady=(self._px(10), self._px(2)))
+                tk.Frame(self._tweaks_inner, bg=C_DIVIDER, height=self._px(1)).pack(
+                    fill="x", padx=PAD_X, pady=(0, self._px(4)))
                 continue
 
             row = tk.Frame(self._tweaks_inner, bg=C_PANEL)
-            row.pack(fill="x", padx=PAD_X, pady=3)
+            row.pack(fill="x", padx=PAD_X, pady=self._px(3))
 
             tk.Label(row, text=label,
                      font=("Segoe UI", 10, "bold"),
@@ -3064,7 +3557,7 @@ class OctoUpdaterApp(tk.Tk):
                                fg=C_TEXT, selectcolor=C_PANEL,
                                highlightthickness=0, bd=0,
                                relief="flat", cursor="hand2"
-                               ).pack(side="left", padx=(4, 12))
+                               ).pack(side="left", padx=(self._px(4), self._px(12)))
                 self._tweak_vars[tid] = var
 
             elif kind == "number":
@@ -3080,7 +3573,8 @@ class OctoUpdaterApp(tk.Tk):
                                  highlightbackground=C_PANEL_BDR,
                                  highlightcolor=C_GOLD,
                                  justify="center")
-                entry.pack(side="left", padx=(4, 12), ipady=3)
+                entry.pack(side="left", padx=(self._px(4), self._px(12)),
+                           ipady=self._px(3))
                 self._tweak_vars[tid]   = var
                 self._tweak_widgets[tid] = entry
 
@@ -3095,10 +3589,36 @@ class OctoUpdaterApp(tk.Tk):
                 entry.bind("<FocusOut>", _clamp)
                 entry.bind("<Return>",   _clamp)
 
+            elif kind == "dropdown":
+                cur = values.get(tid, TWEAKS_DEFAULTS.get(tid))
+                if cur not in LOCALES:
+                    cur = DEFAULT_LOCALE
+                var = tk.StringVar(value=cur)           # holds the locale code
+                var.trace_add("write", self._refresh_tweaks_buttons)
+                mb = tk.Menubutton(
+                    row, text=LOCALES[cur][1], font=("Segoe UI", 10),
+                    fg=C_TEXT, bg="#18181e", activebackground=C_PANEL_BDR,
+                    activeforeground=C_TEXT, relief="flat", cursor="hand2",
+                    width=15, anchor="w", padx=self._px(8), pady=self._px(2),
+                    highlightthickness=1, highlightbackground=C_PANEL_BDR)
+                menu = tk.Menu(mb, tearoff=0, bg=C_PANEL, fg=C_TEXT,
+                               activebackground=C_GOLD, activeforeground="#000")
+                for code, (_i, label) in LOCALES.items():
+                    menu.add_command(
+                        label=label,
+                        command=lambda c=code, v=var: v.set(c))
+                mb["menu"] = menu
+                mb.pack(side="left", padx=(self._px(4), self._px(12)))
+                var.trace_add(
+                    "write",
+                    lambda *_a, m=mb, v=var: m.configure(
+                        text=LOCALES.get(v.get(), (0, v.get()))[1]))
+                self._tweak_vars[tid] = var
+
             if desc:
                 tk.Label(row, text=desc,
                          font=("Segoe UI", 10), fg=C_TEXT_DIM, bg=C_PANEL,
-                         wraplength=520, justify="left", anchor="w"
+                         wraplength=self._px(520), justify="left", anchor="w"
                          ).pack(side="left", fill="x", expand=True)
 
         self._refresh_tweaks_buttons()
@@ -3128,10 +3648,14 @@ class OctoUpdaterApp(tk.Tk):
         defaults["fieldOfView"] = fov_default_for_display()
 
         def norm(d):
-            return {k: (bool(d.get(k))
-                        if isinstance(TWEAKS_DEFAULTS.get(k), bool)
-                        else int(d.get(k, 0)))
-                    for k in ui}
+            def one(k):
+                default = TWEAKS_DEFAULTS.get(k)
+                if isinstance(default, bool):
+                    return bool(d.get(k))
+                if isinstance(default, str):
+                    return str(d.get(k, default))
+                return int(d.get(k, 0))
+            return {k: one(k) for k in ui}
 
         # An out-of-range entry always counts as a change: _get_tweaks_from_ui
         # clamps it, and the clamped value can coincide with the saved one
@@ -3146,8 +3670,8 @@ class OctoUpdaterApp(tk.Tk):
         if dirty:
             self._tweaks_apply_btn.pack(side="left")
         if custom:
-            self._tweaks_reset_btn.pack(side="left",
-                                        padx=(8, 0) if dirty else (0, 0))
+            self._tweaks_reset_btn.pack(
+                side="left", padx=(self._px(8), 0) if dirty else (0, 0))
 
     def _refresh_tweaks_panel(self):
         values = load_tweaks_config()
@@ -3155,6 +3679,8 @@ class OctoUpdaterApp(tk.Tk):
             v = values.get(tid, TWEAKS_DEFAULTS.get(tid))
             if isinstance(var, tk.BooleanVar):
                 var.set(bool(v))
+            elif isinstance(TWEAKS_DEFAULTS.get(tid), str):
+                var.set(v if v in LOCALES else DEFAULT_LOCALE)
             else:
                 var.set(str(int(v)) if v is not None else "")
 
@@ -3165,6 +3691,9 @@ class OctoUpdaterApp(tk.Tk):
         for tid, var in self._tweak_vars.items():
             if isinstance(var, tk.BooleanVar):
                 result[tid] = var.get()
+            elif isinstance(TWEAKS_DEFAULTS.get(tid), str):
+                code = var.get()
+                result[tid] = code if code in LOCALES else DEFAULT_LOCALE
             else:
                 try:
                     v = int(float(var.get()))
@@ -3183,7 +3712,7 @@ class OctoUpdaterApp(tk.Tk):
         defaults["fieldOfView"] = fov_default_for_display()
         save_tweaks_config(defaults)
         self._refresh_tweaks_panel()
-        out = self._path_var.get().strip()
+        out = self._game_path.get().strip()
         if out and os.path.exists(os.path.join(out, "WoW.exe")):
             self._set_btn_busy("Patching…")
             self._status_var.set("Applying tweaks…")
@@ -3198,7 +3727,7 @@ class OctoUpdaterApp(tk.Tk):
         # the UI never keeps showing an out-of-range number after Apply.
         self._refresh_tweaks_panel()
 
-        out = self._path_var.get().strip()
+        out = self._game_path.get().strip()
         if not out:
             self._log_line("Game folder not set.\n", "err")
             return
@@ -3230,27 +3759,9 @@ class OctoUpdaterApp(tk.Tk):
                 pass
 
         try:
-            exe_path = os.path.join(client_dir, "WoW.exe")
-
-            fresh_cfg        = load_config()
-            expected_patched = fresh_cfg.get("expected_patched_wow_hash", "")
-            original_server  = fresh_cfg.get("original_server_wow_hash", "")
-            local_before     = sha1_file(exe_path) if os.path.exists(exe_path) else ""
-
             worker.patch_exe(tweaks)
             drain()
-
             update_config_wtf(client_dir, tweaks)
-
-            local_after = sha1_file(exe_path) if os.path.exists(exe_path) else ""
-
-            def _set_hashes(c):
-                c["expected_patched_wow_hash"] = local_after
-                if local_before == expected_patched and original_server:
-                    c["original_server_wow_hash"] = original_server
-                else:
-                    c.pop("original_server_wow_hash", None)
-            self._cfg = update_config(_set_hashes)
 
             self._log_line("\nTweaks applied.\n", "ok")
             self.after(0, self._refresh_ready_state)
@@ -3263,12 +3774,132 @@ class OctoUpdaterApp(tk.Tk):
                 self._set_btn_update()
             self.after(0, _fail_state)
 
+    # ── version migrations ─────────────────────────────────────────────────────────
+
+    def _new_version_installed(self):
+        """One-time, version-gated migrations run at launch.
+
+        The config key ``octo_updater_version`` records the updater version
+        whose migrations have already been applied to this install (absent on
+        installs predating this mechanism, < 1.3). When it already matches the
+        running ``UPDATER_VERSION`` there's nothing to do.
+
+        Otherwise replay every migration step newer than the stored version,
+        then stamp the current one so each runs exactly once. Runs
+        synchronously (before the normal startup verify is scheduled), so any
+        WoW.exe re-patch is settled before verify reads the exe — no read/write
+        race, and the standard verify still runs and can surface a pending
+        client update. Future versions add their own ``if from_ver < (x, y): …``
+        block below."""
+        cfg = load_config()
+        if cfg.get("octo_updater_version") == UPDATER_VERSION:
+            return
+
+        if not self._first_run:
+            from_ver = _parse_version(cfg.get("octo_updater_version", ""))
+            if from_ver < (1, 3):
+                self._migrate_1_3()
+
+        self._cfg = update_config(
+            lambda c: c.__setitem__("octo_updater_version", UPDATER_VERSION))
+
+    def _migrate_1_3(self):
+        """1.3: raise the ground-clutter defaults for existing installs.
+
+        frillDistance is a VanillaTweak baked into WoW.exe, so bumping the old
+        70 → 120 default needs a re-patch (skipped for a user who already set a
+        higher value). frillDensity is a plain Config.wtf value; if it's still
+        below 128 we lift it to the new default in place."""
+        out = self._game_path.get().strip()
+
+        # frillDistance (VanillaTweak / WoW.exe). Raise to 120 if it's lower
+        stored = dict(load_config().get("tweaks", {}))
+        if int(stored.get("frillDistance", 70)) < 120:
+            stored["frillDistance"] = 120
+            save_tweaks_config(stored)
+            self._log_line(
+                "Ground clutter distance raised to 120 (new default).\n", "acct")
+            if out and os.path.exists(os.path.join(out, "WoW.exe")):
+                self._log_line("Re-patching WoW.exe for v1.3…\n", "acct")
+                self._apply_tweaks_worker(out, load_tweaks_config())
+
+        # frillDensity (Config.wtf value). Raise to 128 if it's lower
+        cfg_path = os.path.join(out, "WTF", "Config.wtf") if out else ""
+        if cfg_path and os.path.exists(cfg_path):
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                changed = False
+                for i, line in enumerate(lines):
+                    if not line.strip().lower().startswith("set frilldensity "):
+                        continue
+                    parts = line.split('"')
+                    cur = (int(parts[1]) if len(parts) >= 2
+                           and parts[1].strip().lstrip("-").isdigit() else None)
+                    if cur is not None and cur < 128:
+                        lines[i] = 'SET frillDensity "128"\n'
+                        changed = True
+                    break
+                if changed:
+                    with open(cfg_path, "w", encoding="utf-8") as f:
+                        f.writelines(lines)
+                    self._log_line(
+                        "Ground clutter density raised to 128 (new default).\n",
+                        "acct")
+            except Exception as e:
+                self._log_line(
+                    f"Could not update frillDensity in Config.wtf: {e}\n", "err")
+
+        # dlls.txt cleanup: earlier versions wrongly registered the loader
+        # (VfPatcher.dll) and dxvk here — neither is loaded via dlls.txt, so a
+        # loader that walks the list would try to load itself / a missing file.
+        dlls_path = _dlls_txt_path(out) if out else ""
+        if dlls_path and os.path.exists(dlls_path):
+            try:
+                present = {l.strip().lower()
+                           for l in open(dlls_path).read().splitlines()}
+                stale = [n for n in ("VfPatcher.dll", "dxvk")
+                         if n.lower() in present]
+                for n in stale:
+                    remove_dll(out, n)
+                if stale:
+                    self._log_line(
+                        f"Removed stale dlls.txt entries: {', '.join(stale)}.\n",
+                        "acct")
+            except Exception as e:
+                self._log_line(f"Could not clean dlls.txt: {e}\n", "err")
+
+        # dxvk.conf: refresh an existing config to the current template
+        # (d3d9.presentInterval, no cursor / numBackBuffers). Only when DXVK is
+        # actually present — a missing dxvk.conf is left alone.
+        if out and os.path.exists(os.path.join(out, "dxvk.conf")):
+            _write_dxvk_conf(out)
+            self._log_line("dxvk.conf updated to the new defaults.\n", "acct")
+
+        # Legacy game-hash cache: the torrent-based download no longer keeps a
+        # per-file SHA-1 cache. Delete the pre-1.3 cache file beside the app.
+        stale_cache = os.path.join(APP_DIR, "octo_updater_hash_cache.json")
+        try:
+            if os.path.exists(stale_cache):
+                os.remove(stale_cache)
+        except OSError:
+            pass
+
+        # Drop the vestigial WoW.exe hash keys from config — unused since the
+        # download revamp (verify is size-based, patching reads the pristine
+        # base), so they'd otherwise linger in every migrated config.
+        self._cfg = update_config(
+            lambda c: (c.pop("expected_patched_wow_hash", None),
+                       c.pop("original_server_wow_hash", None)))
+
+        self._set_pending_reconcile("keep-config")
+
     # ── mods panel ───────────────────────────────────────────────────────────────
 
     def _build_mods_panel(self):
-        PAD       = 18
-        PANEL_TOP = 119
-        PANEL_H   = WIN_H - PANEL_TOP - FOOT_H - 10
+        PAD       = self._px(18)
+        PANEL_TOP = self._px(119)
+        PANEL_H   = WIN_H - PANEL_TOP - FOOT_H - self._px(10)
 
         outer = tk.Frame(self, bg=C_PANEL,
                          highlightthickness=1,
@@ -3276,7 +3907,8 @@ class OctoUpdaterApp(tk.Tk):
         self._mods_panel_frame = outer
 
         note = tk.Frame(outer, bg=C_PANEL)
-        note.pack(fill="x", padx=16, pady=(14, 8), anchor="w")
+        note.pack(fill="x", padx=self._px(16), pady=(self._px(14), self._px(8)),
+                  anchor="w")
         tk.Label(note, text="Mods marked with ",
                  font=("Segoe UI", 10), fg=C_TEXT_DIM,
                  bg=C_PANEL).pack(side="left")
@@ -3286,13 +3918,15 @@ class OctoUpdaterApp(tk.Tk):
                  font=("Segoe UI", 10), fg=C_TEXT_DIM,
                  bg=C_PANEL).pack(side="left")
 
-        tk.Frame(outer, bg=C_DIVIDER, height=1).pack(fill="x", padx=16, pady=(0, 4))
+        tk.Frame(outer, bg=C_DIVIDER, height=self._px(1)).pack(
+            fill="x", padx=self._px(16), pady=(0, self._px(4)))
 
         list_frame = tk.Frame(outer, bg=C_PANEL)
-        list_frame.pack(fill="both", expand=True, padx=16)
+        list_frame.pack(fill="both", expand=True, padx=self._px(16))
 
         canvas = tk.Canvas(list_frame, bg=C_PANEL, highlightthickness=0)
-        sb = SlimScrollbar(list_frame, command=canvas.yview, bg=C_PANEL)
+        sb = SlimScrollbar(list_frame, command=canvas.yview, bg=C_PANEL,
+                           width=self._px(10))
         self._wheel_canvases.append(canvas)
         self._mods_inner = tk.Frame(canvas, bg=C_PANEL)
         self._mods_inner.bind(
@@ -3308,16 +3942,18 @@ class OctoUpdaterApp(tk.Tk):
         sb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
 
-        tk.Frame(outer, bg=C_DIVIDER, height=1).pack(fill="x", padx=16, pady=(4, 0))
+        tk.Frame(outer, bg=C_DIVIDER, height=self._px(1)).pack(
+            fill="x", padx=self._px(16), pady=(self._px(4), 0))
         foot = tk.Frame(outer, bg=C_PANEL)
-        foot.pack(fill="x", padx=16, pady=(6, 10))
+        foot.pack(fill="x", padx=self._px(16), pady=(self._px(6), self._px(10)))
 
         # Packed on demand by _refresh_apply_btn_visibility(): shown only
         # when there are unapplied checkbox changes or a mod is in error.
         self._apply_btn = tk.Label(foot, text="Apply",
                                    font=("Segoe UI", 11),
                                    fg=C_TEXT, bg=C_PANEL_BDR,
-                                   cursor="hand2", padx=16, pady=4)
+                                   cursor="hand2", padx=self._px(16),
+                                   pady=self._px(4))
         self._apply_btn.bind("<Button-1>", lambda e: self._apply_mods())
         self._apply_btn.bind("<Enter>",    lambda e: self._apply_btn.configure(bg=C_GOLD, fg="#000"))
         self._apply_btn.bind("<Leave>",    lambda e: self._apply_btn.configure(bg=C_PANEL_BDR, fg=C_TEXT))
@@ -3332,7 +3968,10 @@ class OctoUpdaterApp(tk.Tk):
         cfg      = load_config()
         mods_cfg = cfg.get("mods", {})
 
-        mods_sorted = sorted(MODS_REGISTRY, key=lambda m: m["name"].lower())
+        # Essential mods first, then alphabetical within each group.
+        mods_sorted = sorted(
+            MODS_REGISTRY,
+            key=lambda m: (not m.get("essential", False), m["name"].lower()))
 
         if self._mod_row_vars:
             for mod in mods_sorted:
@@ -3368,7 +4007,7 @@ class OctoUpdaterApp(tk.Tk):
                 if "error_label" in refs:
                     if has_error:
                         refs["error_label"].configure(text=f"  \u26a0  {state['error']}")
-                        refs["error_label"].pack(fill="x", pady=(0, 4))
+                        refs["error_label"].pack(fill="x", pady=(0, self._px(4)))
                     else:
                         refs["error_label"].pack_forget()
 
@@ -3403,9 +4042,9 @@ class OctoUpdaterApp(tk.Tk):
             container.pack(fill="x")
 
             row = tk.Frame(container, bg=C_PANEL)
-            row.pack(fill="x", pady=5)
+            row.pack(fill="x", pady=self._px(5))
 
-            name_f = tk.Frame(row, bg=C_PANEL, width=210)
+            name_f = tk.Frame(row, bg=C_PANEL, width=self._px(210))
             name_f.pack(side="left", fill="y")
             name_f.pack_propagate(False)
             # Essential mods get a gold star badge; a fixed-width slot keeps
@@ -3431,13 +4070,13 @@ class OctoUpdaterApp(tk.Tk):
                            highlightthickness=0, bd=0,
                            relief="flat", cursor="hand2",
                            command=lambda m=mid, v=enabled_var: self._toggle_mod(m, v)
-                           ).pack(side="left", padx=(4, 8))
+                           ).pack(side="left", padx=(self._px(4), self._px(8)))
 
             # Right-side widgets are packed first so they stay pinned to the
             # panel's right edge; the description then fills the middle.
             ignore_var = tk.BooleanVar(value=ignore_upd)
             ig_f = tk.Frame(row, bg=C_PANEL)
-            ig_f.pack(side="right", padx=(8, 0))
+            ig_f.pack(side="right", padx=(self._px(8), 0))
             tk.Checkbutton(ig_f, variable=ignore_var,
                            bg=C_PANEL, activebackground=C_PANEL,
                            fg=C_TEXT, selectcolor=C_PANEL,
@@ -3451,7 +4090,7 @@ class OctoUpdaterApp(tk.Tk):
             link = tk.Label(row, text="⧉",
                             font=("Segoe UI", 12), fg=C_TEXT_DIM,
                             bg=C_PANEL, cursor="hand2")
-            link.pack(side="right", padx=4)
+            link.pack(side="right", padx=self._px(4))
             link.bind("<Button-1>", lambda e, u=mod["repo_url"]: self._open_url(u))
             link.bind("<Enter>",    lambda e, l=link: l.configure(fg=C_GOLD))
             link.bind("<Leave>",    lambda e, l=link: l.configure(fg=C_TEXT_DIM))
@@ -3469,21 +4108,21 @@ class OctoUpdaterApp(tk.Tk):
             desc_label = tk.Label(row, text=mod["description"],
                                   font=("Segoe UI", 10),
                                   fg=(C_TEXT if enabled else C_TEXT_DIM),
-                                  bg=C_PANEL, wraplength=400,
+                                  bg=C_PANEL, wraplength=self._px(400),
                                   justify="left", anchor="w")
             desc_label.pack(side="left", fill="x", expand=True)
 
             existing_err = state.get("error")
             error_label = tk.Label(container, text="",
                                    font=("Segoe UI", 9), fg=C_ERR,
-                                   bg=C_PANEL, anchor="w", padx=16)
+                                   bg=C_PANEL, anchor="w", padx=self._px(16))
             if existing_err:
                 name_label.configure(fg=C_ERR)
                 error_label.configure(text=f"  \u26a0  {existing_err}")
-                error_label.pack(fill="x", pady=(0, 4))
+                error_label.pack(fill="x", pady=(0, self._px(4)))
 
-            divider = tk.Frame(self._mods_inner, bg=C_DIVIDER, height=1)
-            divider.pack(fill="x", pady=(2, 0))
+            divider = tk.Frame(self._mods_inner, bg=C_DIVIDER, height=self._px(1))
+            divider.pack(fill="x", pady=(self._px(2), 0))
 
             self._mod_row_vars[mid] = {
                 "enabled":      enabled_var,
@@ -3528,9 +4167,98 @@ class OctoUpdaterApp(tk.Tk):
             self._mod_updates_count = count
             self._draw_nav_tab("MODS")
 
+    # The two game-resolution fixes can't coexist: enabling one prompts to
+    # replace the other (see _confirm_res_fix_toggle).
+    _RES_FIX_CONFLICTS = {"no1600x1200": "VanillaMultiMonitorFix",
+                          "VanillaMultiMonitorFix": "no1600x1200"}
+
+    # Per-mod (title, message, confirm) shown when enabling either resolution
+    # fix. confirm=True asks Yes/No and only proceeds on Yes; confirm=False is
+    # an OK-only acknowledgement that always proceeds.
+    _RES_FIX_NOTICE = {
+        "no1600x1200": (
+            "No1600x1200",
+            "No1600x1200 mod may cause the game to crash on launch on some "
+            "systems.\n\n"
+            "VanillaMultiMonitorFix is the recommended resolution fix. Use "
+            "No1600x1200 only if VanillaMultiMonitorFix doesn't solve your "
+            "problem.\n\n"
+            "Enable No1600x1200 anyway?",
+            True),
+        "VanillaMultiMonitorFix": (
+            "VanillaMultiMonitorFix",
+            "Enable this mod only if the game doesn't detect your monitor's "
+            "native resolution.\n\n"
+            "VanillaMultiMonitorFix may interfere with correct resolution "
+            "detection. By default, it's recommended to first try launching the "
+            "game with DXVK, which may fix the resolution detection issue.\n\n"
+            "Enable VanillaMultiMonitorFix only if you're actually experiencing "
+            "resolution issues.",
+            False),
+    }
+
     def _toggle_mod(self, mod_id: str, var: tk.BooleanVar):
+        # Turning on one of the conflicting resolution fixes needs confirmation
+        # before it becomes a pending change.
+        if var.get() and mod_id in self._RES_FIX_CONFLICTS:
+            if not self._confirm_res_fix_toggle(mod_id, var):
+                return   # backed out — var + pending already reset
         self._mod_pending_state.setdefault(mod_id, {})["enabled"] = var.get()
         self._refresh_apply_btn_visibility()
+
+    def _mod_is_on(self, mod_id: str) -> bool:
+        """Whether a mod is currently on in the UI: a pending toggle wins,
+        otherwise its saved enabled state."""
+        pending = self._mod_pending_state.get(mod_id, {})
+        if "enabled" in pending:
+            return bool(pending["enabled"])
+        return bool(load_config().get("mods", {}).get(mod_id, {}).get("enabled"))
+
+    def _confirm_res_fix_toggle(self, mod_id: str, var: tk.BooleanVar) -> bool:
+        """Confirm enabling no1600x1200 / VanillaMultiMonitorFix. They conflict,
+        so first offer to replace the other one, then show that mod's own notice
+        (_RES_FIX_NOTICE). Returns True to proceed, or False if the user backed
+        out — in which case the checkbox and pending state are reset to 'off'."""
+        from tkinter import messagebox
+        other = self._RES_FIX_CONFLICTS[mod_id]
+        name  = next(m["name"] for m in MODS_REGISTRY if m["id"] == mod_id)
+        oname = next(m["name"] for m in MODS_REGISTRY if m["id"] == other)
+
+        def _cancel():
+            var.set(False)
+            self._mod_pending_state.pop(mod_id, None)
+            self._refresh_apply_btn_visibility()
+
+        # 1) Conflict — only when the other fix is currently on.
+        replace_other = self._mod_is_on(other)
+        if replace_other and not messagebox.askyesno(
+                "Conflicting mods",
+                f"{name} and {oname} both affect the game's resolution detection "
+                f"and can't be used together — only one can be active at a time.\n\n"
+                f"VanillaMultiMonitorFix is recommended if you experience "
+                f"resolution issues in the game.\n\n"
+                f"Replace {oname} with {name}?",
+                parent=self):
+            _cancel()
+            return False
+
+        # 2) That mod's own notice (crash risk / usage guidance). A confirm
+        # notice can still cancel the toggle; an OK-only one just informs.
+        title, message, confirm = self._RES_FIX_NOTICE[mod_id]
+        if confirm:
+            if not messagebox.askyesno(title, message, parent=self):
+                _cancel()
+                return False
+        else:
+            messagebox.showinfo(title, message, parent=self)
+
+        # Confirmed — schedule the other fix for removal and untick its box.
+        if replace_other:
+            self._mod_pending_state.setdefault(other, {})["enabled"] = False
+            other_var = self._mod_row_vars.get(other, {}).get("enabled")
+            if other_var is not None:
+                other_var.set(False)
+        return True
 
     def _set_ignore(self, mod_id: str, var: tk.BooleanVar):
         self._mod_pending_state.setdefault(mod_id, {})["ignore_updates"] = var.get()
@@ -3559,11 +4287,11 @@ class OctoUpdaterApp(tk.Tk):
         if state.get("error"):
             lbl._base, lbl._hover = C_GOLD, C_GOLD_LT
             lbl.configure(text="retry", fg=C_GOLD)
-            lbl.pack(side="right", padx=(2, 8))
+            lbl.pack(side="right", padx=(self._px(2), self._px(8)))
         elif mod_update_available(mod, state, live):
             lbl._base, lbl._hover = C_GOLD, C_GOLD_LT
             lbl.configure(text="update", fg=C_GOLD)
-            lbl.pack(side="right", padx=(2, 8))
+            lbl.pack(side="right", padx=(self._px(2), self._px(8)))
         else:
             lbl.pack_forget()
 
@@ -3571,7 +4299,7 @@ class OctoUpdaterApp(tk.Tk):
         """Download and install the newest release of a single mod (the
         per-row "update" label). Runs through the normal apply worker so
         errors/versions are recorded exactly like a manual Apply."""
-        out = self._path_var.get().strip()
+        out = self._game_path.get().strip()
         if not out:
             return
         mod = next(m for m in MODS_REGISTRY if m["id"] == mod_id)
@@ -3582,7 +4310,7 @@ class OctoUpdaterApp(tk.Tk):
                          args=(out, mod_id), daemon=True).start()
 
     def _apply_mods(self):
-        out = self._path_var.get().strip()
+        out = self._game_path.get().strip()
         if not out:
             return
         self._apply_btn.configure(text="Applying...", bg="#2a2a32", fg=C_TEXT_DIM)
@@ -3603,7 +4331,7 @@ class OctoUpdaterApp(tk.Tk):
         if load_config().get("addons") is not None:
             return  # already initialized for this folder
 
-        out = self._path_var.get().strip()
+        out = self._game_path.get().strip()
         if not out or not os.path.exists(os.path.join(out, "WoW.exe")):
             return  # game isn't actually installed here yet
 
@@ -3653,7 +4381,7 @@ class OctoUpdaterApp(tk.Tk):
         if cfg.get("mods"):
             return  # already initialized for this folder
 
-        out = self._path_var.get().strip()
+        out = self._game_path.get().strip()
         if not out or not os.path.exists(os.path.join(out, "WoW.exe")):
             return  # game isn't actually installed here yet
 
@@ -3683,7 +4411,7 @@ class OctoUpdaterApp(tk.Tk):
         ordered = MODS_REGISTRY
 
         pending = self._mod_pending_state
-        # Arm the one-time "DXVK first launch" notice if dxvk gets (re)installed
+        # Arm the one-time "DXVK first launch" notice if DXVK gets (re)installed
         # this run — the new d3d9.dll invalidates the shader cache.
         set_dxvk_notice = False
 
@@ -3858,7 +4586,7 @@ class OctoUpdaterApp(tk.Tk):
                     if has_error:
                         refs["error_label"].configure(
                             text=f"  \u26a0  {state['error']}")
-                        refs["error_label"].pack(fill="x", pady=(0, 4))
+                        refs["error_label"].pack(fill="x", pady=(0, self._px(4)))
                     else:
                         refs["error_label"].pack_forget()
 
@@ -3892,7 +4620,7 @@ class OctoUpdaterApp(tk.Tk):
         self._addons_panel_frame = outer
 
         top = tk.Frame(outer, bg=C_PANEL)
-        top.pack(fill="x", padx=16, pady=(4, 0))
+        top.pack(fill="x", padx=self._px(16), pady=(self._px(4), 0))
         self._addon_filter_var = tk.StringVar()
         self._addon_filter_job = None
         self._addon_filter_var.trace_add(
@@ -3905,7 +4633,7 @@ class OctoUpdaterApp(tk.Tk):
                        highlightcolor=C_GOLD)
         tk.Label(top, text="⌕", font=("Segoe UI", 18),
                  fg=C_TEXT, bg=C_PANEL).pack(side="right")
-        ent.pack(side="right", ipady=4, padx=(0, 6))
+        ent.pack(side="right", ipady=self._px(4), padx=(0, self._px(6)))
 
         legend = tk.Frame(top, bg=C_PANEL)
         legend.pack(side="left")
@@ -3919,9 +4647,10 @@ class OctoUpdaterApp(tk.Tk):
                  bg=C_PANEL).pack(side="left")
 
         list_frame = tk.Frame(outer, bg=C_PANEL)
-        list_frame.pack(fill="both", expand=True, padx=(16, 4))
+        list_frame.pack(fill="both", expand=True, padx=(self._px(16), self._px(4)))
         canvas = tk.Canvas(list_frame, bg=C_PANEL, highlightthickness=0)
-        sb = SlimScrollbar(list_frame, command=canvas.yview, bg=C_PANEL)
+        sb = SlimScrollbar(list_frame, command=canvas.yview, bg=C_PANEL,
+                           width=self._px(10))
         self._wheel_canvases.append(canvas)
         self._addons_canvas = canvas
         self._addons_win    = None
@@ -3933,10 +4662,10 @@ class OctoUpdaterApp(tk.Tk):
         canvas.pack(side="left", fill="both", expand=True)
         self._reset_addons_inner()
 
-        tk.Frame(outer, bg=C_DIVIDER, height=1).pack(fill="x", padx=16,
-                                                     pady=(4, 0))
+        tk.Frame(outer, bg=C_DIVIDER, height=self._px(1)).pack(
+            fill="x", padx=self._px(16), pady=(self._px(4), 0))
         foot = tk.Frame(outer, bg=C_PANEL)
-        foot.pack(fill="x", padx=16, pady=(8, 12))
+        foot.pack(fill="x", padx=self._px(16), pady=(self._px(8), self._px(12)))
         foot.columnconfigure(0, weight=1)
         foot.columnconfigure(1, weight=1)
         foot.columnconfigure(2, weight=1)
@@ -3966,6 +4695,226 @@ class OctoUpdaterApp(tk.Tk):
 
         self._render_addons()
 
+    # ── MPQ panel ────────────────────────────────────────────────────────────
+
+    def _build_mpq_panel(self):
+        outer = tk.Frame(self, bg=C_PANEL,
+                         highlightthickness=1,
+                         highlightbackground=C_PANEL_BDR,
+                         highlightcolor=C_PANEL_BDR)
+        self._mpq_panel_frame = outer
+
+        list_frame = tk.Frame(outer, bg=C_PANEL)
+        list_frame.pack(fill="both", expand=True,
+                        padx=(self._px(16), self._px(4)),
+                        pady=(self._px(8), self._px(8)))
+        canvas = tk.Canvas(list_frame, bg=C_PANEL, highlightthickness=0)
+        sb = SlimScrollbar(list_frame, command=canvas.yview, bg=C_PANEL,
+                           width=self._px(10))
+        self._wheel_canvases.append(canvas)
+        self._mpq_canvas = canvas
+        self._mpq_win    = None
+        canvas.bind("<Configure>",
+                    lambda e: self._mpq_win is not None
+                    and canvas.itemconfigure(self._mpq_win, width=e.width))
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        self._mpq_sections_open = {"INSTALLED": True, "AVAILABLE": True}
+        self._mpq_installed_rows = []
+        self._mpq_available_rows = list(MPQ_PATCHES)
+        self._reset_mpq_inner()
+        self._render_mpq()
+
+    def _reset_mpq_inner(self):
+        cv  = self._mpq_canvas
+        old = getattr(self, "_mpq_inner", None)
+        if old is not None:
+            old.destroy()
+        inner = tk.Frame(cv, bg=C_PANEL)
+        inner.bind("<Configure>",
+                   lambda e: cv.configure(scrollregion=cv.bbox("all")))
+        if self._mpq_win is None:
+            self._mpq_win = cv.create_window((0, 0), window=inner, anchor="nw",
+                                             width=cv.winfo_width() or 1)
+        else:
+            cv.itemconfigure(self._mpq_win, window=inner)
+        cv.yview_moveto(0)
+        self._mpq_inner = inner
+
+    def _scan_mpq_patches(self) -> list:
+        """Lettered patch archives (patch-<letter>.mpq, case-insensitive) present in the
+        game's Data folder, e.g. Patch-A.mpq / patch-b.MPQ. Sorted by letter."""
+        out = self._game_path.get().strip()
+        data_dir = os.path.join(out, "Data") if out else ""
+        found = []
+        if data_dir and os.path.isdir(data_dir):
+            for name in os.listdir(data_dir):
+                if re.fullmatch(r"patch-[a-z]\.mpq", name, re.IGNORECASE):
+                    found.append(name)
+        found.sort(key=str.lower)
+        return found
+
+    def _mpq_check(self):
+        """Scan Data/ for lettered patches; for the ones we know (registry),
+        compare the on-disk SHA256 to the server's to flag updates. Feeds the
+        INSTALLED/AVAILABLE lists and the tab badge; the sha check runs in the
+        background so the list appears immediately."""
+        installed_files = self._scan_mpq_patches()
+        installed_lc    = {f.lower() for f in installed_files}
+        self._mpq_installed_rows = [
+            {"file": f, "entry": mpq_patch_for(f), "update": False}
+            for f in installed_files]
+        self._mpq_available_rows = [
+            e for e in MPQ_PATCHES if e["file"].lower() not in installed_lc]
+        self._render_mpq()
+
+        out = self._game_path.get().strip()
+        data_dir = os.path.join(out, "Data") if out else ""
+        known = [r for r in self._mpq_installed_rows if r["entry"]]
+        if not (known and data_dir):
+            self._mpq_updates_count = 0
+            self._draw_nav_tab("MPQ")
+            return
+
+        def worker():
+            results = {}
+            for row in known:
+                try:
+                    server = fetch_mpq_sha256(row["entry"]["url"])
+                    local  = sha256_file(os.path.join(data_dir, row["file"]))
+                    results[row["file"]] = (server != local)
+                except Exception:
+                    results[row["file"]] = False
+
+            def apply():
+                count = 0
+                for row in self._mpq_installed_rows:
+                    if row["file"] in results:
+                        row["update"] = results[row["file"]]
+                        count += bool(row["update"])
+                self._mpq_updates_count = count
+                self._draw_nav_tab("MPQ")
+                self._render_mpq()
+            self.after(0, apply)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _render_mpq(self):
+        if not hasattr(self, "_mpq_inner"):
+            return
+        self._reset_mpq_inner()
+        installed = getattr(self, "_mpq_installed_rows", [])
+        available = getattr(self, "_mpq_available_rows", [])
+        busy = getattr(self, "_mpq_busy", None)
+
+        self._mpq_section_header("INSTALLED", installed)
+        if self._mpq_sections_open.get("INSTALLED", True):
+            for row in installed:
+                entry  = row["entry"]
+                name   = entry["name"] if entry else row["file"]
+                desc   = entry["description"] if entry else ""
+                action = ("Update", entry) if (row["update"] and entry) else None
+                self._mpq_row(name, row["file"], desc, action,
+                              busy == row["file"])
+
+        self._mpq_section_header("AVAILABLE", available)
+        if self._mpq_sections_open.get("AVAILABLE", True):
+            for entry in available:
+                self._mpq_row(entry["name"], entry["file"],
+                              entry["description"], ("Install", entry),
+                              busy == entry["file"])
+
+    def _mpq_section_header(self, title: str, rows: list):
+        f = self._mpq_inner
+        is_open = self._mpq_sections_open.get(title, True)
+        hdr = tk.Frame(f, bg=C_PANEL)
+        hdr.pack(fill="x", pady=(self._px(10), self._px(2)))
+        arrow = tk.Label(hdr, text="▾" if is_open else "▸",
+                         font=("Segoe UI", 14, "bold"),
+                         fg=C_GOLD, bg=C_PANEL, cursor="hand2", width=2)
+        arrow.pack(side="left")
+        lbl = tk.Label(hdr, text=title, font=("Segoe UI", 12, "bold"),
+                       fg=C_GOLD, bg=C_PANEL, cursor="hand2")
+        lbl.pack(side="left")
+        tk.Label(hdr, text=f"  {len(rows)}", font=("Segoe UI", 10),
+                 fg=C_TEXT_DIM, bg=C_PANEL).pack(side="left")
+
+        def toggle(_e=None, t=title):
+            self._mpq_sections_open[t] = \
+                not self._mpq_sections_open.get(t, True)
+            self._render_mpq()
+        arrow.bind("<Button-1>", toggle)
+        lbl.bind("<Button-1>", toggle)
+
+        if is_open and not rows:
+            tk.Label(f, text="Nothing here.", font=("Segoe UI", 10),
+                     fg=C_TEXT_DIM, bg=C_PANEL).pack(anchor="w",
+                                                     padx=self._px(8))
+
+    def _mpq_row(self, name, filename, description, action, busy):
+        """One patch row: name (and filename), an Install/Update button or a
+        'Downloading…' label, and the description underneath. `action` is
+        (label, registry_entry) or None."""
+        f = self._mpq_inner
+        box = tk.Frame(f, bg=C_PANEL)
+        box.pack(fill="x", pady=self._px(4))
+        top = tk.Frame(box, bg=C_PANEL)
+        top.pack(fill="x")
+        tk.Label(top, text=name, font=("Segoe UI", 11, "bold"),
+                 fg=C_TEXT, bg=C_PANEL, anchor="w").pack(side="left",
+                                                         padx=self._px(8))
+        if filename and filename.lower() != name.lower():
+            tk.Label(top, text=f"  {filename}", font=("Segoe UI", 9),
+                     fg=C_TEXT_DIM, bg=C_PANEL).pack(side="left")
+        if busy:
+            tk.Label(top, text="Downloading…", font=("Segoe UI", 10),
+                     fg=C_TEXT_DIM, bg=C_PANEL).pack(side="right",
+                                                     padx=self._px(8))
+        elif action:
+            label, entry = action
+            btn = tk.Label(top, text=label, font=("Segoe UI", 10, "bold"),
+                           fg="#000", bg=C_GOLD, cursor="hand2",
+                           padx=self._px(12), pady=self._px(2))
+            btn.pack(side="right", padx=self._px(8))
+            btn.bind("<Button-1>", lambda e, en=entry: self._mpq_install(en))
+            btn.bind("<Enter>", lambda e: btn.configure(bg=C_GOLD_LT))
+            btn.bind("<Leave>", lambda e: btn.configure(bg=C_GOLD))
+        if description:
+            tk.Label(box, text=description, font=("Segoe UI", 10),
+                     fg=C_TEXT_DIM, bg=C_PANEL, anchor="w",
+                     wraplength=self._px(620), justify="left").pack(
+                     fill="x", padx=self._px(8), pady=(self._px(2), 0))
+
+    def _mpq_install(self, entry):
+        if getattr(self, "_mpq_busy", None):
+            return                                   # one download at a time
+        out = self._game_path.get().strip()
+        if not out:
+            self._log_line("Set the game folder first.\n", "err")
+            return
+        data_dir = os.path.join(out, "Data")
+        self._mpq_busy = entry["file"]
+        self._render_mpq()
+        self._log_line(f"\nDownloading {entry['name']}…\n", "acct")
+
+        def worker():
+            err = None
+            try:
+                download_mpq_patch(entry, data_dir)
+            except Exception as e:
+                err = str(e)
+
+            def done():
+                self._mpq_busy = None
+                if err:
+                    self._log_line(f"✗  {entry['name']} failed: {err}\n", "err")
+                else:
+                    self._log_line(f"✓  {entry['name']} installed.\n", "ok")
+                self._mpq_check()                    # re-scan + re-check + badge
+            self.after(0, done)
+        threading.Thread(target=worker, daemon=True).start()
+
     # ── addons engine (app side) ─────────────────────────────────────────────
 
     def _addons_verify(self, force=False, remote_checks=True):
@@ -3981,7 +4930,7 @@ class OctoUpdaterApp(tk.Tk):
                 and (time.time() - self._addons_verified_ts)
                 < ADDONS_VERIFY_TTL):
             return
-        client = self._path_var.get().strip()
+        client = self._game_path.get().strip()
         self._addons_busy = True
         had_content = bool(self._addons_status["addons"]
                            or self._addons_status["available"])
@@ -4049,15 +4998,20 @@ class OctoUpdaterApp(tk.Tk):
                     saved = records.get(name)
                     override = RECOMMENDED_ADDONS.get(name)
                     if (saved and saved.get("git") and override
+                            and not saved.get("custom")
                             and not _same_git_repo(saved["git"], override)):
-                        # Installed from a different repo than the curated
-                        # fork — offer an update that migrates to the fork.
+                        # Installed from a different repo than the curated fork
+                        # — offer an update that migrates to the fork. A
+                        # user-added custom addon (saved["custom"]) is left as
+                        # the user chose it, even when its name matches a
+                        # recommended addon.
                         rec.update(git=override, branch=None, ref=None,
                                    status="outOfDate")
                     elif saved and saved.get("git"):
                         rec.update(git=saved.get("git"),
                                    branch=saved.get("branch"),
-                                   ref=saved.get("ref"))
+                                   ref=saved.get("ref"),
+                                   custom=saved.get("custom", False))
                         if remote_checks:
                             remote = addon_remote_sha(
                                 rec["git"], rec["branch"], rec["ref"],
@@ -4118,7 +5072,7 @@ class OctoUpdaterApp(tk.Tk):
 
     def _addon_apply(self, recs):
         """Install/update the given addon records sequentially."""
-        client = self._path_var.get().strip()
+        client = self._game_path.get().strip()
         if not client or self._addons_busy or not recs:
             return
         self._addons_busy = True
@@ -4149,6 +5103,8 @@ class OctoUpdaterApp(tk.Tk):
                         patch_pfui_default_profile(client)
                     record = {"git": rec["git"], "branch": rec.get("branch"),
                               "ref": rec.get("ref"), "sha": sha}
+                    if rec.get("custom"):
+                        record["custom"] = True
                     update_config(lambda c, f=rec["folder"], r=record:
                                   c.setdefault("addons", {}).__setitem__(f, r))
                     self._addon_errors.pop(rec["folder"], None)
@@ -4182,7 +5138,7 @@ class OctoUpdaterApp(tk.Tk):
                 "Remove addon",
                 f"Delete {folder} and all of its files?"):
             return
-        client = self._path_var.get().strip()
+        client = self._game_path.get().strip()
         if not client or self._addons_busy:
             return
         try:
@@ -4209,28 +5165,29 @@ class OctoUpdaterApp(tk.Tk):
 
         # Same purple-dark theme as the Settings modal.
         P_BG, P_HDR, P_BDR, P_INP = C_PANEL, C_HDR, C_PANEL_BDR, "#0f0b16"
-        MW, MH = 560, 230
+        MW, MH = self._px(560), self._px(230)
         panel = tk.Frame(ov, bg=P_BG, highlightthickness=1,
                          highlightbackground=P_BDR, highlightcolor=P_BDR)
-        panel.place(x=(WIN_W - MW) // 2, y=(WIN_H - MH) // 2 - 20,
+        panel.place(x=(WIN_W - MW) // 2, y=(WIN_H - MH) // 2 - self._px(20),
                     width=MW, height=MH)
 
-        hdr = tk.Frame(panel, bg=P_HDR, height=46)
+        hdr = tk.Frame(panel, bg=P_HDR, height=self._px(46))
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
         tk.Label(hdr, text="ADD CUSTOM GIT ADDON",
                  font=("Segoe UI", 13, "bold"),
-                 fg=C_PURPLE, bg=P_HDR).pack(side="left", padx=18)
+                 fg=C_PURPLE, bg=P_HDR).pack(side="left", padx=self._px(18))
         x_btn = tk.Label(hdr, text="✕", font=("Segoe UI", 12),
                          fg=C_TEXT_DIM, bg=P_HDR, cursor="hand2")
-        x_btn.pack(side="right", padx=16)
+        x_btn.pack(side="right", padx=self._px(16))
         x_btn.bind("<Button-1>", lambda e: self._close_settings())
         x_btn.bind("<Enter>",    lambda e: x_btn.configure(fg=C_TEXT))
         x_btn.bind("<Leave>",    lambda e: x_btn.configure(fg=C_TEXT_DIM))
-        tk.Frame(panel, bg=P_BDR, height=1).pack(fill="x")
+        tk.Frame(panel, bg=P_BDR, height=self._px(1)).pack(fill="x")
 
         body = tk.Frame(panel, bg=P_BG)
-        body.pack(fill="both", expand=True, padx=22, pady=(16, 12))
+        body.pack(fill="both", expand=True, padx=self._px(22),
+                  pady=(self._px(16), self._px(12)))
         tk.Label(body, text="REPOSITORY URL",
                  font=("Segoe UI", 10, "bold"),
                  fg=C_GOLD, bg=P_BG).pack(anchor="w")
@@ -4238,7 +5195,8 @@ class OctoUpdaterApp(tk.Tk):
         tk.Entry(body, textvariable=url_var, bg=P_INP, fg=C_TEXT,
                  insertbackground=C_GOLD, relief="flat", font=FONT_MONO,
                  highlightthickness=1, highlightbackground=P_BDR,
-                 highlightcolor=C_GOLD).pack(fill="x", ipady=7, pady=(6, 6))
+                 highlightcolor=C_GOLD).pack(fill="x", ipady=self._px(7),
+                                             pady=(self._px(6), self._px(6)))
         tk.Label(body,
                  text="Allowed hosts: " + ", ".join(ADDON_GIT_HOSTS),
                  font=("Segoe UI", 9), fg=C_TEXT_DIM, bg=P_BG).pack(anchor="w")
@@ -4262,11 +5220,12 @@ class OctoUpdaterApp(tk.Tk):
             self._addon_apply([{"folder": folder, "status": "available",
                                 "git": url, "branch": None, "ref": None,
                                 "toc": {}, "description": None,
-                                "error": None}])
+                                "error": None, "custom": True}])
 
         btn = tk.Label(body, text="Install", font=("Segoe UI", 11, "bold"),
-                       fg=C_TEXT, bg=P_BDR, cursor="hand2", padx=16, pady=7)
-        btn.pack(anchor="e", pady=(8, 0))
+                       fg=C_TEXT, bg=P_BDR, cursor="hand2",
+                       padx=self._px(16), pady=self._px(7))
+        btn.pack(anchor="e", pady=(self._px(8), 0))
         btn.bind("<Button-1>", lambda e: submit())
         btn.bind("<Enter>", lambda e: btn.configure(bg=C_GOLD, fg="#000"))
         btn.bind("<Leave>", lambda e: btn.configure(bg=P_BDR, fg=C_TEXT))
@@ -4331,9 +5290,8 @@ class OctoUpdaterApp(tk.Tk):
             return [r for r in lst if matches(r)]
 
         installed = keep(st["addons"].values())
-        # Recommended addons are no longer their own section — they're mixed
-        # into Available and marked with a ★ badge. Sort recommended first so
-        # they surface at the top of the list.
+        # Recommended addons are mixed into Available and marked with a ★
+        # badge. Sort recommended first so they surface at the top of the list.
         available = keep(a for a in st["available"]
                          if a["folder"] not in st["addons"])
         available.sort(key=lambda a: (a["folder"] not in RECOMMENDED_ADDONS,
@@ -4371,7 +5329,7 @@ class OctoUpdaterApp(tk.Tk):
         is_open = self._addon_sections_open.get(title, True)
 
         hdr = tk.Frame(f, bg=C_PANEL)
-        hdr.pack(fill="x", pady=(10, 2))
+        hdr.pack(fill="x", pady=(self._px(10), self._px(2)))
         arrow = tk.Label(hdr, text="▾" if is_open else "▸",
                          font=("Segoe UI", 14, "bold"),
                          fg=C_GOLD, bg=C_PANEL, cursor="hand2", width=2)
@@ -4394,7 +5352,7 @@ class OctoUpdaterApp(tk.Tk):
             msg = ("Verifying…" if self._addons_status["state"] == "verifying"
                    else "Nothing here.")
             tk.Label(f, text=msg, font=("Segoe UI", 10), fg=C_TEXT_DIM,
-                     bg=C_PANEL).pack(anchor="w", padx=8)
+                     bg=C_PANEL).pack(anchor="w", padx=self._px(8))
 
     def _addon_row(self, rec: dict):
         f = self._addons_inner
@@ -4416,24 +5374,24 @@ class OctoUpdaterApp(tk.Tk):
                 warnings.append("Missing deps: " + ", ".join(missing))
 
         row = tk.Frame(f, bg=C_PANEL)
-        row.pack(fill="x", pady=3)
+        row.pack(fill="x", pady=self._px(3))
 
 
         # right side first so it stays pinned to the edge
         if installed:
             # Trash can drawn as canvas shapes (handle, lid, tapered body
             # with slats) — same fixed-size approach as the download arrow.
-            rm = tk.Canvas(row, width=20, height=18, bg=C_PANEL,
-                           highlightthickness=0, cursor="hand2")
-            rm.pack(side="right", padx=(8, 2))
-            rm.create_rectangle(8, 2, 12, 4, fill="#8a4a4a", outline="",
-                                tags="trash")
-            rm.create_rectangle(4, 4, 16, 6, fill="#8a4a4a", outline="",
-                                tags="trash")
-            rm.create_polygon(5, 8, 15, 8, 14, 16, 6, 16,
+            rm = tk.Canvas(row, width=self._px(20), height=self._px(18),
+                           bg=C_PANEL, highlightthickness=0, cursor="hand2")
+            rm.pack(side="right", padx=(self._px(8), self._px(2)))
+            rm.create_rectangle(*self._px(8, 2, 12, 4), fill="#8a4a4a",
+                                outline="", tags="trash")
+            rm.create_rectangle(*self._px(4, 4, 16, 6), fill="#8a4a4a",
+                                outline="", tags="trash")
+            rm.create_polygon(*self._px(5, 8, 15, 8, 14, 16, 6, 16),
                               fill="#8a4a4a", outline="", tags="trash")
             for x in (8, 10, 12):
-                rm.create_line(x, 10, x, 14, fill=C_PANEL)
+                rm.create_line(*self._px(x, 10, x, 14), fill=C_PANEL)
             rm.bind("<Button-1>",
                     lambda e, n=rec["folder"]: self._addon_remove(n))
             rm.bind("<Enter>", lambda e, c=rm:
@@ -4443,11 +5401,11 @@ class OctoUpdaterApp(tk.Tk):
         else:
             # Download arrow drawn as a polygon — exact size and centering,
             # independent of any font, without inflating the row height.
-            dl = tk.Canvas(row, width=20, height=18, bg=C_PANEL,
-                           highlightthickness=0, cursor="hand2")
-            dl.pack(side="right", padx=(8, 2))
+            dl = tk.Canvas(row, width=self._px(20), height=self._px(18),
+                           bg=C_PANEL, highlightthickness=0, cursor="hand2")
+            dl.pack(side="right", padx=(self._px(8), self._px(2)))
             dl_item = dl.create_polygon(
-                8, 3, 12, 3, 12, 9, 16, 9, 10, 15, 4, 9, 8, 9,
+                *self._px(8, 3, 12, 3, 12, 9, 16, 9, 10, 15, 4, 9, 8, 9),
                 fill=C_OK, outline="")
             dl.bind("<Button-1>",
                     lambda e, r=rec: self._addon_apply([dict(r)]))
@@ -4463,7 +5421,7 @@ class OctoUpdaterApp(tk.Tk):
                 else rec["git"]
             lnk = tk.Label(row, text="⧉", font=("Segoe UI", 10),
                            fg=C_TEXT_DIM, bg=C_PANEL, cursor="hand2")
-            lnk.pack(side="right", padx=(4, 2))
+            lnk.pack(side="right", padx=(self._px(4), self._px(2)))
             lnk.bind("<Button-1>", lambda e, u=repo_url: self._open_url(u))
             lnk.bind("<Enter>", lambda e, w=lnk: w.configure(fg=C_GOLD))
             lnk.bind("<Leave>", lambda e, w=lnk: w.configure(fg=C_TEXT_DIM))
@@ -4471,32 +5429,32 @@ class OctoUpdaterApp(tk.Tk):
         status = rec["status"]
         if status == "downloading":
             tk.Label(row, text="downloading…", font=("Segoe UI", 10),
-                     fg=C_TEXT_DIM, bg=C_PANEL).pack(side="right", padx=4)
+                     fg=C_TEXT_DIM, bg=C_PANEL).pack(side="right", padx=self._px(4))
         elif status == "invalid" or rec.get("error"):
             # Short marker on the right; the full reason gets its own line
             # under the row (long messages would squeeze the description).
             tk.Label(row, text="⛔ Addon error", font=("Segoe UI", 10),
-                     fg=C_ERR, bg=C_PANEL).pack(side="right", padx=4)
+                     fg=C_ERR, bg=C_PANEL).pack(side="right", padx=self._px(4))
         elif status == "outOfDate" and installed:
             upd = tk.Label(row, text="Update", font=("Segoe UI", 10, "bold"),
                            fg=C_GOLD, bg=C_PANEL, cursor="hand2")
-            upd.pack(side="right", padx=4)
+            upd.pack(side="right", padx=self._px(4))
             upd.bind("<Button-1>",
                      lambda e, r=rec: self._addon_apply([r]))
             upd.bind("<Enter>", lambda e, w=upd: w.configure(fg=C_GOLD_LT))
             upd.bind("<Leave>", lambda e, w=upd: w.configure(fg=C_GOLD))
         elif warnings:
             tk.Label(row, text=f"⚠ {warnings[0]}", font=("Segoe UI", 10),
-                     fg="#d4b43c", bg=C_PANEL).pack(side="right", padx=4)
+                     fg="#d4b43c", bg=C_PANEL).pack(side="right", padx=self._px(4))
         elif status == "upToDate":
             tk.Label(row, text="Up to date", font=("Segoe UI", 10),
-                     fg=C_TEXT_DIM, bg=C_PANEL).pack(side="right", padx=4)
+                     fg=C_TEXT_DIM, bg=C_PANEL).pack(side="right", padx=self._px(4))
         elif status == "unknown":
             tk.Label(row, text="Not versioned", font=("Segoe UI", 10),
-                     fg=C_TEXT_DIM, bg=C_PANEL).pack(side="right", padx=4)
+                     fg=C_TEXT_DIM, bg=C_PANEL).pack(side="right", padx=self._px(4))
 
         # name (WoW colour codes honoured) + repo link
-        name_f = tk.Frame(row, bg=C_PANEL, width=250)
+        name_f = tk.Frame(row, bg=C_PANEL, width=self._px(250))
         name_f.pack(side="left", fill="y")
         name_f.pack_propagate(False)
         # Gold ★ badge for recommended addons; fixed-width slot keeps the
@@ -4516,16 +5474,17 @@ class OctoUpdaterApp(tk.Tk):
         desc = strip_wow_colors(toc.get("Notes")
                                 or rec.get("description") or "")
         tk.Label(row, text=desc, font=("Segoe UI", 10), fg=C_TEXT_DIM,
-                 bg=C_PANEL, wraplength=430, justify="left",
+                 bg=C_PANEL, wraplength=self._px(430), justify="left",
                  anchor="w").pack(side="left", fill="x", expand=True)
 
         if rec.get("error"):
             tk.Label(f, text=f"  ⚠  {rec['error']}",
                      font=("Segoe UI", 9), fg=C_ERR, bg=C_PANEL,
-                     wraplength=840, justify="left",
-                     anchor="w").pack(fill="x", pady=(0, 3))
+                     wraplength=self._px(840), justify="left",
+                     anchor="w").pack(fill="x", pady=(0, self._px(3)))
 
-        tk.Frame(f, bg=C_DIVIDER, height=1).pack(fill="x", pady=(3, 0))
+        tk.Frame(f, bg=C_DIVIDER, height=self._px(1)).pack(
+            fill="x", pady=(self._px(3), 0))
 
     def _refresh_addons_badge(self):
         count = sum(1 for r in self._addons_status["addons"].values()
@@ -4556,25 +5515,25 @@ class OctoUpdaterApp(tk.Tk):
         # the middle, client version at the bottom (with a bottom margin so
         # the content doesn't sit flush against the window edge).
         left = tk.Frame(foot, bg=C_BG)
-        left.place(x=40, y=6)
+        left.place(x=self._px(40), y=self._px(6))
 
         self._status_var = tk.StringVar(value="Ready to update")
         tk.Label(left, textvariable=self._status_var,
                  font=("Segoe UI", 10, "bold"),
-                 fg=C_TEXT, bg=C_BG).pack(anchor="w")
+                 fg=C_TEXT, bg=C_BG, width=26, anchor="w").pack(anchor="w")
 
         # Thin halo frame around the button gives a soft glow that follows
         # the button state (gold for UPDATE, green for PLAY).
         self._btn_mode = "update"
         self._btn_glow = tk.Frame(left, bg="#4a3812")
-        self._btn_glow.pack(anchor="w", pady=(6, 6))
+        self._btn_glow.pack(anchor="w", pady=(self._px(6), self._px(6)))
         self._upd_btn = tk.Label(self._btn_glow, text="UPDATE",
                                  font=("Segoe UI", 11, "bold"),
                                  fg="#ffffff", bg=C_GOLD,
                                  cursor="hand2",
-                                 width=14, pady=7,
+                                 width=14, pady=self._px(7),
                                  anchor="center")
-        self._upd_btn.pack(padx=3, pady=3)
+        self._upd_btn.pack(padx=self._px(3), pady=self._px(3))
         self._upd_btn.bind("<Button-1>", lambda e: self._btn_click())
         self._upd_btn.bind("<Enter>",    lambda e: self._btn_hover(True))
         self._upd_btn.bind("<Leave>",    lambda e: self._btn_hover(False))
@@ -4582,30 +5541,30 @@ class OctoUpdaterApp(tk.Tk):
         self._client_ver_var = tk.StringVar(value="")
         tk.Label(left, textvariable=self._client_ver_var,
                  font=FONT_VER, fg=C_TEXT_DIM, bg=C_BG).pack(
-                 anchor="w", pady=(0, 36))
+                 anchor="w", pady=(0, self._px(36)))
 
         pb_frame = tk.Frame(foot, bg=C_BG)
-        pb_frame.place(x=250, y=0, width=WIN_W - 250 - 40, height=FOOT_H)
+        pb_frame.place(x=self._px(250), y=0,
+                       width=WIN_W - self._px(250) - self._px(40), height=FOOT_H)
 
         self._pb_canvas = tk.Canvas(pb_frame,
-                                    height=6, bg=C_BG,
+                                    height=self._px(6), bg=C_BG,
                                     highlightthickness=0)
         self._pb_canvas.pack(fill="x", side="bottom", padx=0,
-                             ipady=0, pady=(0, 56))
-        self._pb_width  = WIN_W - 250 - 40
+                             ipady=0, pady=(0, self._px(56)))
+        self._pb_width  = WIN_W - self._px(250) - self._px(40)
         self._pb_val    = 0.0
 
         self._prog_label_var = tk.StringVar(value="")
         tk.Label(pb_frame, textvariable=self._prog_label_var,
                  font=("Segoe UI", 10), fg=C_TEXT, bg=C_BG).pack(
-                 side="bottom", pady=(0, 6))
-
-        self._draw_progress(0.0)
+                 side="bottom", pady=(0, self._px(6)))
 
         tk.Label(foot, text=f"v{UPDATER_VERSION}",
                  font=("Courier New", 8),
                  fg="#555560", bg=C_BG).place(relx=1.0, rely=1.0,
-                                              x=-10, y=-6, anchor="se")
+                                              x=self._px(-10), y=self._px(-6),
+                                              anchor="se")
 
         # Align the progress bar's bottom edge exactly with the PLAY/UPDATE
         # button's bottom edge once real geometry is known.
@@ -4622,11 +5581,9 @@ class OctoUpdaterApp(tk.Tk):
         c = self._pb_canvas
         w = self._pb_width
         c.delete("all")
-        # Hide the bar entirely when idle (0) or finished/full (1) — it only
-        # shows while something is actively downloading/updating.
-        if self._pb_val <= 0.0 or self._pb_val >= 1.0:
+        if not self._running:
             return
-        c.create_rectangle(0, 0, w, 6, fill="#1e1e26", outline="")
+        c.create_rectangle(0, 0, w, self._px(6), fill="#1e1e26", outline="")
         filled = int(w * self._pb_val)
         if filled > 0:
             for x in range(filled):
@@ -4635,82 +5592,69 @@ class OctoUpdaterApp(tk.Tk):
                 g_val = int(0x92 + t * (0xb8 - 0x92))
                 b_val = int(0x2a + t * (0x4b - 0x2a))
                 col   = f"#{r_val:02x}{g_val:02x}{b_val:02x}"
-                c.create_line(x, 0, x, 6, fill=col)
+                c.create_line(x, 0, x, self._px(6), fill=col)
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
-    def _on_path_changed(self, *args):
-        """Fires whenever the Game folder entry's value actually changes (typed,
-        pasted, or set via Browse…). Resets the hash caches so the next verify
-        re-checks every file from scratch and tweaks/mods get re-applied/installed
-        against the new folder instead of reusing stale state from the old one."""
-        new_val = os.path.normpath(self._path_var.get().strip())
-        last_val = os.path.normpath(self._last_path_val)
-
-        if new_val == last_val:
-            return
-
-        self._last_path_val = new_val
-        if not new_val:
-            return
-
-        try:
-            if os.path.exists(CACHE_FILE):
-                os.remove(CACHE_FILE)
-        except Exception:
-            pass
-
-        # Only touch WDB when the path is a real client folder — this trace
-        # fires on every keystroke while a path is being typed.
+    def _game_folder_changed(self, new_val: str):
+        """Wipe all state tied to the previous game folder — the folder-scoped
+        config (mods/addons install records) and session TTLs/badges — and
+        point everything at new_val. Called from _close_settings when the user
+        has switched to a different folder."""
         if os.path.exists(os.path.join(new_val, "WoW.exe")):
             remove_wdb(new_val)
 
-        # Wipe folder-scoped config (patched-exe hashes + mods/addons install
-        # records) and set the new path — one atomic merge into the live
-        # config. This also re-arms the default-mods and recommended-addons
-        # auto-install for the new folder.
-        def _reset_for_new_folder(c):
+        # Wipe folder-scoped config and set the new path in one atomic merge.
+        # This also re-arms the default-mods / recommended-addons auto-install.
+        def _wipe(c):
             c["out_dir"] = new_val
-            for k in ("expected_patched_wow_hash", "original_server_wow_hash",
-                      "mods", "addons"):
+            for k in ("mods", "addons"):
                 c.pop(k, None)
-        self._cfg = update_config(_reset_for_new_folder)
+        self._cfg = update_config(_wipe)
 
         self._mod_pending_state = {}
         self._default_mods_install_started = False
         self._default_addons_install_started = False
         self._client_ready = False
 
-        # Reset every session-level TTL/state so nothing from the previous
-        # folder is served from memory: addons verify + its rendered list,
-        # news feed timers, and the nav-tab update badges.
+        # Reset session-level state so nothing from the previous folder is
+        # served from memory: addons verify + rendered list, news timers, badges.
         self._addons_verified_ts = 0.0
         self._addons_status = {"state": "idle", "addons": {}, "available": []}
         self._addon_errors = {}
         self._feat_ts = 0.0
-        self._news_ts = 0.0
+        self._patch_ts = 0.0
         self._mod_updates_count = 0
         self._addon_updates_count = 0
+        self._mpq_updates_count = 0
+        self._mpq_installed_rows = []
+        self._mpq_available_rows = list(MPQ_PATCHES)
         self._draw_nav_tab("MODS")
         self._draw_nav_tab("ADDONS")
+        self._draw_nav_tab("MPQ")
         self._render_addons()
+        self._render_mpq()
 
-        self._diff_nodes = None
+        self._log_line("\nGame folder changed — state reset.\n", "acct")
 
-        self._log_line(
-            "\nGame folder changed — cache reset, everything will be re-verified.\n",
-            "acct")
+    def _set_pending_reconcile(self, mode):
+        """Set the pending-reconcile mode (None / 'full' / 'keep-config') and
+        persist it, so a reconcile offered but not applied before quitting is
+        still pending next launch."""
+        self._pending_reconcile = mode or None
+        self._cfg = update_config(
+            lambda c: c.__setitem__("pending_reconcile", self._pending_reconcile))
 
-        # This verify covers the new folder — overwrite its Config.wtf with our
-        # defaults + realmList. It also supersedes the first-run settings-close
-        # verify.
-        self._first_run_verify_pending = False
-        self.after(100, lambda: self._start_verify(overwrite_config=True))
-
-        # A deliberate folder change already covers the antivirus
-        # recommendation, so the first-run settings-close shouldn't ask again.
-        self._first_run_av_pending = False
-        self._prompt_av_exclusion()
+    def _offer_reconcile(self):
+        """Surface the Update button for the pending reconcile (mode already
+        set) WITHOUT running a verify first. Clicking Update then reconciles:
+        an integrity check + WoW.exe re-patch (+ a fresh Config.wtf when the
+        mode is 'full') — meaningful even when the game files are already
+        intact."""
+        self._running = False
+        self._client_ready = False
+        self._status_var.set("Update available!")
+        self._set_btn_update()
 
     def _prompt_av_exclusion(self):
         """Ask whether to add the current game folder to Windows Defender
@@ -4769,28 +5713,29 @@ class OctoUpdaterApp(tk.Tk):
         self.bind("<Escape>", lambda e: self._close_settings())
 
         P_BG, P_HDR, P_BDR, P_INP = C_PANEL, C_HDR, C_PANEL_BDR, "#0f0b16"
-        MW, MH = 800, 500
+        MW, MH = self._px(800), self._px(500)
         panel = tk.Frame(ov, bg=P_BG, highlightthickness=1,
                          highlightbackground=P_BDR, highlightcolor=P_BDR)
-        panel.place(x=(WIN_W - MW) // 2, y=(WIN_H - MH) // 2 - 20,
+        panel.place(x=(WIN_W - MW) // 2, y=(WIN_H - MH) // 2 - self._px(20),
                     width=MW, height=MH)
 
-        hdr = tk.Frame(panel, bg=P_HDR, height=46)
+        hdr = tk.Frame(panel, bg=P_HDR, height=self._px(46))
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
         tk.Label(hdr, text="SETTINGS", font=("Segoe UI", 13, "bold"),
-                 fg=C_PURPLE, bg=P_HDR).pack(side="left", padx=18)
+                 fg=C_PURPLE, bg=P_HDR).pack(side="left", padx=self._px(18))
         x_btn = tk.Label(hdr, text="✕", font=("Segoe UI", 12),
                          fg=C_TEXT_DIM, bg=P_HDR, cursor="hand2")
-        x_btn.pack(side="right", padx=16)
+        x_btn.pack(side="right", padx=self._px(16))
         x_btn.bind("<Button-1>", lambda e: self._close_settings())
         x_btn.bind("<Enter>",    lambda e: x_btn.configure(fg=C_TEXT))
         x_btn.bind("<Leave>",    lambda e: x_btn.configure(fg=C_TEXT_DIM))
-        tk.Frame(panel, bg=P_BDR, height=1).pack(fill="x")
+        tk.Frame(panel, bg=P_BDR, height=self._px(1)).pack(fill="x")
 
-        PADX = 22
+        PADX = self._px(22)
         body = tk.Frame(panel, bg=P_BG)
-        body.pack(fill="both", expand=True, padx=PADX, pady=(16, 12))
+        body.pack(fill="both", expand=True, padx=PADX,
+                  pady=(self._px(16), self._px(12)))
 
         loc_row = tk.Frame(body, bg=P_BG)
         loc_row.pack(fill="x")
@@ -4799,7 +5744,7 @@ class OctoUpdaterApp(tk.Tk):
                  fg=C_GOLD, bg=P_BG).pack(side="left")
         opn = tk.Label(loc_row, text="Open folder", font=FONT_BODY,
                        fg=C_TEXT_DIM, bg=P_BG, cursor="hand2")
-        opn.pack(side="left", padx=(16, 0))
+        opn.pack(side="left", padx=(self._px(16), 0))
         opn.bind("<Button-1>", lambda e: self._open_client_folder())
         opn.bind("<Enter>",    lambda e: opn.configure(fg=C_GOLD))
         opn.bind("<Leave>",    lambda e: opn.configure(fg=C_TEXT_DIM))
@@ -4807,47 +5752,27 @@ class OctoUpdaterApp(tk.Tk):
         # Same StringVar as the Update tab's Game folder entry — changing it
         # here fires the exact same folder-change mechanics immediately.
         path_row = tk.Frame(body, bg=P_BG)
-        path_row.pack(fill="x", pady=(8, 0))
-        ent = tk.Entry(path_row, textvariable=self._path_var,
+        path_row.pack(fill="x", pady=(self._px(8), 0))
+        ent = tk.Entry(path_row, textvariable=self._game_path,
                        bg=P_INP, fg=C_TEXT, relief="flat", font=FONT_MONO,
                        state="readonly", readonlybackground=P_INP,
                        highlightthickness=1, highlightbackground=P_BDR,
                        highlightcolor=P_BDR)
-        ent.pack(side="left", fill="x", expand=True, ipady=7)
+        ent.pack(side="left", fill="x", expand=True, ipady=self._px(7))
         chg = tk.Label(path_row, text="Change",
                        font=("Segoe UI", 10, "bold"),
-                       fg=C_TEXT, bg=P_BDR, cursor="hand2", padx=16, pady=7)
-        chg.pack(side="left", padx=(8, 0))
+                       fg=C_TEXT, bg=P_BDR, cursor="hand2",
+                       padx=self._px(16), pady=self._px(7))
+        chg.pack(side="left", padx=(self._px(8), 0))
         chg.bind("<Button-1>", lambda e: self._settings_change_dir())
         chg.bind("<Enter>",    lambda e: chg.configure(bg=C_GOLD, fg="#000"))
         chg.bind("<Leave>",    lambda e: chg.configure(bg=P_BDR, fg=C_TEXT))
-
-        tk.Label(body, text="DOWNLOAD MIRROR",
-                 font=("Segoe UI", 10, "bold"),
-                 fg=C_GOLD, bg=P_BG).pack(anchor="w", pady=(20, 4))
-        mir = tk.Frame(body, bg=P_BG)
-        mir.pack(fill="x")
-        tk.Label(mir, text="●", font=("Segoe UI", 9),
-                 fg=C_OK, bg=P_BG).pack(side="left")
-        tk.Label(mir, text=" Iceland", font=("Segoe UI", 10, "bold"),
-                 fg=C_TEXT, bg=P_BG).pack(side="left")
-        self._mirror_status_lbl = tk.Label(mir, text="checking…",
-                                           font=("Segoe UI", 9),
-                                           fg=C_TEXT_DIM, bg=P_BG)
-        self._mirror_status_lbl.pack(side="left", padx=(8, 0))
-        rf = tk.Label(mir, text="⟳", font=("Segoe UI", 11),
-                      fg=C_TEXT_DIM, bg=P_BG, cursor="hand2")
-        rf.pack(side="left", padx=(6, 0))
-        rf.bind("<Button-1>", lambda e: self._check_mirror_status())
-        rf.bind("<Enter>",    lambda e: rf.configure(fg=C_GOLD))
-        rf.bind("<Leave>",    lambda e: rf.configure(fg=C_TEXT_DIM))
-        self._check_mirror_status()
 
         # Two equal-width columns via grid, so the right column keeps a fixed
         # position and reaches toward the right edge — regardless of how wide
         # the left column's text is.
         cols = tk.Frame(body, bg=P_BG)
-        cols.pack(fill="x", pady=(22, 0))
+        cols.pack(fill="x", pady=(self._px(20), 0))
         cols.columnconfigure(0, weight=3, uniform="s")
         cols.columnconfigure(1, weight=2, uniform="s")
         lcol = tk.Frame(cols, bg=P_BG)
@@ -4855,13 +5780,34 @@ class OctoUpdaterApp(tk.Tk):
         rcol = tk.Frame(cols, bg=P_BG)
         rcol.grid(row=0, column=1, sticky="nw")
 
+        tk.Label(lcol, text="DOWNLOAD MIRROR",
+                 font=("Segoe UI", 10, "bold"),
+                 fg=C_GOLD, bg=P_BG).pack(anchor="w", pady=(0, self._px(4)))
+        mir = tk.Frame(lcol, bg=P_BG)
+        mir.pack(anchor="w")
+        tk.Label(mir, text="●", font=("Segoe UI", 9),
+                 fg=C_OK, bg=P_BG).pack(side="left")
+        tk.Label(mir, text=" Iceland", font=("Segoe UI", 10, "bold"),
+                 fg=C_TEXT, bg=P_BG).pack(side="left")
+        self._mirror_status_lbl = tk.Label(mir, text="checking…",
+                                           font=("Segoe UI", 9),
+                                           fg=C_TEXT_DIM, bg=P_BG)
+        self._mirror_status_lbl.pack(side="left", padx=(self._px(8), 0))
+        rf = tk.Label(mir, text="⟳", font=("Segoe UI", 11),
+                      fg=C_TEXT_DIM, bg=P_BG, cursor="hand2")
+        rf.pack(side="left", padx=(self._px(6), 0))
+        rf.bind("<Button-1>", lambda e: self._check_mirror_status())
+        rf.bind("<Enter>",    lambda e: rf.configure(fg=C_GOLD))
+        rf.bind("<Leave>",    lambda e: rf.configure(fg=C_TEXT_DIM))
+        self._check_mirror_status()
+
         tk.Label(lcol, text="TROUBLESHOOTING",
                  font=("Segoe UI", 10, "bold"),
-                 fg=C_GOLD, bg=P_BG).pack(anchor="w")
+                 fg=C_GOLD, bg=P_BG).pack(anchor="w", pady=(self._px(22), 0))
 
         def _titem(icon, text, cmd, icon_color=C_GOLD):
             r = tk.Frame(lcol, bg=P_BG, cursor="hand2")
-            r.pack(anchor="w", pady=(12, 0))
+            r.pack(anchor="w", pady=(self._px(12), 0))
             # Monochrome glyphs in a fixed-width slot so all icons line up
             # and read at the same size (color emoji would render larger).
             ic = tk.Label(r, text=icon, font=("Segoe UI Symbol", 11),
@@ -4882,7 +5828,7 @@ class OctoUpdaterApp(tk.Tk):
 
         tk.Label(lcol, text="SUPPORT THE DEVELOPER",
                  font=("Segoe UI", 10, "bold"),
-                 fg=C_GOLD, bg=P_BG).pack(anchor="w", pady=(22, 0))
+                 fg=C_GOLD, bg=P_BG).pack(anchor="w", pady=(self._px(22), 0))
         _titem("♥", "Ko-fi",
                lambda: self._open_url("https://ko-fi.com/rebased"),
                icon_color="#e8615f")
@@ -4899,21 +5845,21 @@ class OctoUpdaterApp(tk.Tk):
                        font=("Segoe UI", 10), fg=C_TEXT, bg=P_BG,
                        activebackground=P_BG, activeforeground=C_TEXT,
                        selectcolor=P_INP, highlightthickness=0, bd=0,
-                       cursor="hand2").pack(anchor="w", pady=(10, 0))
-        tk.Checkbutton(rcol, text=" Close Octo Updater on game launch",
+                       cursor="hand2").pack(anchor="w", pady=(self._px(10), 0))
+        tk.Checkbutton(rcol, text=" Minimize Octo Updater on game launch",
                        variable=self._close_on_launch_var,
                        command=self._toggle_close_on_launch,
                        font=("Segoe UI", 10), fg=C_TEXT, bg=P_BG,
                        activebackground=P_BG, activeforeground=C_TEXT,
                        selectcolor=P_INP, highlightthickness=0, bd=0,
-                       cursor="hand2").pack(anchor="w", pady=(10, 0))
+                       cursor="hand2").pack(anchor="w", pady=(self._px(10), 0))
         cb_auto_mods = tk.Checkbutton(
             rcol, text=" Install essential mods",
             variable=self._auto_mods_var, command=self._toggle_auto_mods,
             font=("Segoe UI", 10), fg=C_TEXT, bg=P_BG,
             activebackground=P_BG, activeforeground=C_TEXT,
             selectcolor=P_INP, highlightthickness=0, bd=0, cursor="hand2")
-        cb_auto_mods.pack(anchor="w", pady=(10, 0))
+        cb_auto_mods.pack(anchor="w", pady=(self._px(10), 0))
         self._add_tooltip(
             cb_auto_mods,
             "VanillaFixes will always be installed, even when this "
@@ -4924,36 +5870,65 @@ class OctoUpdaterApp(tk.Tk):
                        font=("Segoe UI", 10), fg=C_TEXT, bg=P_BG,
                        activebackground=P_BG, activeforeground=C_TEXT,
                        selectcolor=P_INP, highlightthickness=0, bd=0,
-                       cursor="hand2").pack(anchor="w", pady=(10, 0))
+                       cursor="hand2").pack(anchor="w", pady=(self._px(10), 0))
+        cb_ignore_speech = tk.Checkbutton(
+            rcol, text=" Ignore speech.mpq",
+            variable=self._ignore_speech_var,
+            command=self._toggle_ignore_speech,
+            font=("Segoe UI", 10), fg=C_TEXT, bg=P_BG,
+            activebackground=P_BG, activeforeground=C_TEXT,
+            selectcolor=P_INP, highlightthickness=0, bd=0, cursor="hand2")
+        cb_ignore_speech.pack(anchor="w", pady=(self._px(10), 0))
+        self._add_tooltip(
+            cb_ignore_speech,
+            "Ignores verification and updates for speech.mpq, allowing custom "
+            "speech sounds")
 
     def _close_settings(self):
         self.unbind("<Escape>")
         if self._settings_overlay is not None:
             self._settings_overlay.destroy()
             self._settings_overlay = None
-        # First run: the user has now committed to a game folder (kept the
-        # default). Run the deferred verification against it and (over)write a
-        # fresh Config.wtf with our defaults + realmList.
-        if self._first_run_verify_pending:
-            self._first_run_verify_pending = False
-            self.after(100, lambda: self._start_verify(overwrite_config=True))
-        # Apply any auto-install option the user turned on this session
-        # (idempotent — a no-op when nothing is missing).
-        if self._auto_mods_retrigger:
-            self._auto_mods_retrigger = False
-            self._install_missing_essential_mods()
-        if self._auto_addons_retrigger:
-            self._auto_addons_retrigger = False
-            self._install_missing_recommended_addons()
-        # First run: the user accepted the auto-selected folder (never changed
-        # it) and never added a Defender exclusion — recommend it now, once.
-        if self._first_run_av_pending:
-            self._first_run_av_pending = False
-            self._prompt_av_exclusion()
+
+        # Closing Settings is the "Confirm" action. It needs a reconcile when
+        # this is the first run, or the chosen folder now differs from the saved
+        # one — the two cases are handled identically from here on.
+        new_path  = os.path.normpath(self._game_path.get().strip())
+        saved     = os.path.normpath(self._cfg.get("out_dir", ""))
+        folder_changed = bool(new_path) and new_path != saved
+        needs_reconcile = self._first_run or folder_changed
+        self._first_run = False
+
+        if folder_changed:
+            self._game_folder_changed(new_path)
+        if needs_reconcile:
+            self._set_pending_reconcile("full")
+            self._offer_reconcile()
+            # The reconcile installs mods/addons itself — drop any pending
+            # auto-install retriggers so they don't race it.
+            self._auto_mods_retrigger = self._auto_addons_retrigger = False
+        else:
+            # A settings change with no reconcile: apply an auto-install option
+            # the user turned on this session (idempotent — no-op if nothing
+            # missing).
+            if self._auto_mods_retrigger:
+                self._auto_mods_retrigger = False
+                self._install_missing_essential_mods()
+            if self._auto_addons_retrigger:
+                self._auto_addons_retrigger = False
+                self._install_missing_recommended_addons()
+
+        # Offer a Defender exclusion at each reconcile, unless the user already
+        # added one via Settings since the last reconcile. Reset after, so a
+        # later reconcile (e.g. another folder change) offers it again.
+        if needs_reconcile:
+            if not self._av_excluded:
+                self._prompt_av_exclusion()
+            self._av_excluded = False
 
     def _open_client_folder(self):
         import subprocess
-        path = os.path.normpath(self._path_var.get().strip())
+        path = os.path.normpath(self._game_path.get().strip())
         if os.path.isdir(path):
             # Explicit explorer.exe, not os.startfile: ShellExecute resolves
             # extensionless paths against PATHEXT/.lnk, so a Desktop shortcut
@@ -4965,14 +5940,14 @@ class OctoUpdaterApp(tk.Tk):
             self._log_line(f"Folder not found: {path}\n", "err")
 
     def _settings_change_dir(self):
-        cur     = self._path_var.get()
+        cur     = self._game_path.get()
         initial = cur if os.path.isdir(cur) else os.path.expanduser("~")
         chosen  = filedialog.askdirectory(
             title="Select game client folder",
             initialdir=initial, mustexist=False)
         if chosen:
             # normpath → backslashes; fires the folder-change reset
-            self._path_var.set(os.path.normpath(chosen))
+            self._game_path.set(os.path.normpath(chosen))
 
     def _settings_verify(self):
         self._close_settings()
@@ -4981,10 +5956,7 @@ class OctoUpdaterApp(tk.Tk):
     def _allow_through_antivirus(self):
         """Add a Windows Defender exclusion for the game folder (asks for
         admin elevation via UAC)."""
-        # The user handled the exclusion themselves — no need to prompt again
-        # when the first-run Settings window closes.
-        self._first_run_av_pending = False
-        client_dir = os.path.normpath(self._path_var.get().strip())
+        client_dir = os.path.normpath(self._game_path.get().strip())
         if not client_dir or client_dir == ".":
             return
         import ctypes
@@ -4993,10 +5965,31 @@ class OctoUpdaterApp(tk.Tk):
             None, "runas", "powershell.exe",
             f'-NoProfile -WindowStyle Hidden -Command "{cmd}"', None, 0)
         if r > 32:
+            self._av_excluded = True
             self._log_line(
                 f"Requested Defender exclusion for: {client_dir}\n", "ok")
         else:
             self._log_line("Antivirus exclusion cancelled.\n", "err")
+
+    def _maybe_show_aria2_firewall_notice(self):
+        """One-time heads-up, shown before the first download, that the bundled
+        aria2c downloader may trigger a Windows Firewall prompt — so it doesn't
+        look sketchy to a non-technical user. Purely informational; tracked in
+        the config so it appears only once."""
+        if self._cfg.get("aria2_firewall_notice_shown"):
+            return
+        from tkinter import messagebox
+        messagebox.showinfo(
+            "Downloading the game",
+            "Octo Updater downloads the game with aria2c, the same tool the "
+            "official launcher uses.\n\n"
+            "You may be asked to allow aria2c through the firewall. You can "
+            "safely reject the request, but download speeds may be slightly "
+            "lower.\n\n"
+            "This message is shown only once.",
+            parent=self)
+        self._cfg = update_config(
+            lambda c: c.__setitem__("aria2_firewall_notice_shown", True))
 
     def _check_mirror_status(self):
         lbl = self._mirror_status_lbl
@@ -5006,9 +5999,9 @@ class OctoUpdaterApp(tk.Tk):
             ok = False
             try:
                 req = urllib.request.Request(
-                    f"{SERVER}/api/file/{DOWNLOAD_VERSION}/manifest.json",
-                    headers={"User-Agent": UA})
-                with secure_urlopen(req, timeout=6):
+                    CLIENT_TORRENT_URL, headers={"User-Agent": UA})
+                with secure_urlopen(req, timeout=6,
+                                    allowed_hosts=ALLOWED_DOWNLOAD_HOSTS):
                     ok = True
             except Exception:
                 ok = False
@@ -5046,12 +6039,17 @@ class OctoUpdaterApp(tk.Tk):
             lambda c: c.__setitem__("auto_install_addons", val))
         self._auto_addons_retrigger = val
 
+    def _toggle_ignore_speech(self):
+        self._cfg = update_config(
+            lambda c: c.__setitem__("ignore_speech",
+                                    self._ignore_speech_var.get()))
+
     def _install_missing_essential_mods(self):
         """Install every essential mod not already present. Used when the user
         turns 'Install essential mods' on after the fact."""
         if self._running:
             return
-        out = self._path_var.get().strip()
+        out = self._game_path.get().strip()
         if not out or not os.path.exists(os.path.join(out, "WoW.exe")):
             return  # no client yet — the fresh-folder auto-install handles it
         mods_cfg = load_config().get("mods", {})
@@ -5078,7 +6076,7 @@ class OctoUpdaterApp(tk.Tk):
         user turns 'Install recommended addons' on afterwards."""
         if self._addons_busy:
             return
-        out = self._path_var.get().strip()
+        out = self._game_path.get().strip()
         if not out or not os.path.exists(os.path.join(out, "WoW.exe")):
             return
         ap = addons_path(out)
@@ -5093,27 +6091,17 @@ class OctoUpdaterApp(tk.Tk):
         self._addon_apply(recs)
 
     def _verify_game_files(self):
-        """Full re-verification: drop the hash cache and the patched-exe
-        bookkeeping so every file is re-hashed against the manifest and
-        WoW.exe gets re-downloaded and re-patched (tweaks reapplied). Unlike
-        a game-folder change, installed mods are left alone."""
+        """Full integrity pass: aria2 hash-checks every game file's pieces
+        against the torrent and re-downloads only the bad/missing ones, then
+        re-patches WoW.exe. Catches same-size corruption the routine size-based
+        sync can't. Installed mods are left alone."""
         if self._running:
             return
-        try:
-            if os.path.exists(CACHE_FILE):
-                os.remove(CACHE_FILE)
-        except Exception:
-            pass
-        def _drop_hashes(c):
-            c.pop("expected_patched_wow_hash", None)
-            c.pop("original_server_wow_hash", None)
-        self._cfg = update_config(_drop_hashes)
-        self._diff_nodes = None
         self._client_ready = False
         self._log_line(
-            "\nVerify game files — cache dropped, re-checking everything.\n",
+            "\nVerify game files — hash-checking every file against the torrent.\n",
             "acct")
-        self._start_verify()
+        self._start_update(check_integrity=True)
 
     def _show_logs(self):
         if self._logwin is not None:
@@ -5128,24 +6116,25 @@ class OctoUpdaterApp(tk.Tk):
 
         win = tk.Toplevel(self)
         win.title("Octo Updater — Logs")
-        LW, LH = 760, 420
+        LW, LH = self._px(760), self._px(420)
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
         win.geometry(f"{LW}x{LH}+{(sw - LW) // 2}+{(sh - LH) // 2}")
         win.configure(bg=C_BG)
 
         top = tk.Frame(win, bg=C_BG)
-        top.pack(fill="x", padx=12, pady=(10, 4))
+        top.pack(fill="x", padx=self._px(12), pady=(self._px(10), self._px(4)))
         tk.Label(top, text="SESSION LOG", font=("Segoe UI", 9, "bold"),
                  fg=C_GOLD, bg=C_BG).pack(side="left")
 
         outer = tk.Frame(win, bg=C_BG)
-        outer.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-        sb = SlimScrollbar(outer, bg=C_BG)
+        outer.pack(fill="both", expand=True, padx=self._px(12),
+                   pady=(0, self._px(12)))
+        sb = SlimScrollbar(outer, bg=C_BG, width=self._px(10))
         sb.pack(side="right", fill="y")
         txt = tk.Text(outer, bg=C_LOG_BG, fg=C_TEXT,
                       insertbackground=C_TEXT, relief="flat",
                       font=FONT_MONO, wrap="word", state="disabled",
-                      padx=10, pady=8, yscrollcommand=sb.set,
+                      padx=self._px(10), pady=self._px(8), yscrollcommand=sb.set,
                       cursor="arrow", selectbackground=C_PANEL_BDR)
         txt.pack(side="left", fill="both", expand=True)
         sb.command = txt.yview
@@ -5234,10 +6223,10 @@ class OctoUpdaterApp(tk.Tk):
 
     def _launch_game(self):
         """Launch the game detached.
-        If VanillaFixes is installed use VanillaFixes.exe (it injects patches then
+        If VanillaFixes is installed use VanillaFixes.exe (it injects dlls then
         starts WoW.exe itself). Otherwise fall back to WoW.exe directly."""
         import subprocess
-        client_dir = self._path_var.get().strip()
+        client_dir = self._game_path.get().strip()
         cfg        = load_config()
         vf_state   = cfg.get("mods", {}).get("VanillaFixes", {})
         vf_installed = (vf_state.get("enabled") and
@@ -5255,7 +6244,7 @@ class OctoUpdaterApp(tk.Tk):
             self._log_line(f"{exe_lbl} not found at: {exe}\n", "err")
             return
 
-        # One-time DXVK first-launch notice (armed when dxvk was installed).
+        # One-time DXVK first-launch notice (armed when DXVK was installed).
         if cfg.get("dxvk_notice_pending"):
             self._cfg = update_config(
                 lambda c: c.pop("dxvk_notice_pending", None))
@@ -5287,18 +6276,17 @@ class OctoUpdaterApp(tk.Tk):
             # Briefly disable PLAY so a double-click can't spawn two clients.
             self._set_btn_busy("PLAY")
             self._status_var.set("Launching...")
-            # Optionally close the updater shortly after launch.
+            # Optionally minimize (close) the updater to the taskbar shortly after launch
             if self._cfg.get("close_on_launch", False):
-                self.after(1000, self._on_close)
-                return
+                self.after(1000, self.iconify) # self._on_close and return
             self.after(5000, self._refresh_ready_state)
         except Exception as e:
             self._log_line(f"Failed to launch {exe_lbl}: {e}\n", "err")
 
     # ── verify lifecycle ──────────────────────────────────────────────────────────
 
-    def _start_verify(self, overwrite_config: bool = False):
-        out = self._path_var.get().strip()
+    def _start_verify(self):
+        out = self._game_path.get().strip()
         if not out:
             self._set_btn_update()
             return
@@ -5309,49 +6297,49 @@ class OctoUpdaterApp(tk.Tk):
             prev.cancel()
         self._running = True
         self._set_btn_busy("Checking…")
-        self._status_var.set("Verifying…")
-        self._draw_progress(0.0)
-        self._prog_label_var.set("")
+        self._status_var.set("Checking for updates…")
         self._log_q  = queue.Queue()
         self._prog_q = queue.Queue()
-        patched_hash  = self._cfg.get("expected_patched_wow_hash", "")
-        original_hash = self._cfg.get("original_server_wow_hash", "")
-        worker = VerifyWorker(out, self._log_q, self._prog_q, patched_hash,
-                              original_hash, overwrite_config=overwrite_config)
+        worker = VerifyWorker(out, self._log_q, self._prog_q)
         self._verify_worker = worker
         threading.Thread(target=worker.run, daemon=True).start()
 
     # ── update lifecycle ──────────────────────────────────────────────────────────
 
-    def _start_update(self):
+    def _start_update(self, check_integrity: bool = False,
+                      overwrite_config: bool = False):
         if self._running:
             return
-        out = self._path_var.get().strip()
+        if self._pending_reconcile:
+            check_integrity  = True
+            overwrite_config = (self._pending_reconcile == "full")
+            self._set_pending_reconcile(None)
+        out = self._game_path.get().strip()
         if not out:
             self._log_line("✗  Please set the game folder first.\n", "err")
             return
 
         self._cfg = update_config(lambda c: c.__setitem__("out_dir", out))
 
+        self._maybe_show_aria2_firewall_notice()
+
         self._log_line(f"\nGame folder: {out}\n", "dim")
 
         self._running = True
-        self._set_btn_busy("Updating…")
-        self._status_var.set("Updating…")
+        self._set_btn_busy("Verifying…" if check_integrity else "Updating…")
+        self._status_var.set("Verifying game files…" if check_integrity
+                             else "Updating…")
         self._draw_progress(0.0)
         self._prog_label_var.set("")
 
         self._log_q  = queue.Queue()
         self._prog_q = queue.Queue()
-        patched_hash   = self._cfg.get("expected_patched_wow_hash", "")
-        original_hash  = self._cfg.get("original_server_wow_hash", "")
 
-        self._worker   = UpdateWorker(out, self._log_q, self._prog_q, patched_hash)
-        self._worker.original_server_wow_hash = original_hash
+        self._worker   = UpdateWorker(out, self._log_q, self._prog_q,
+                                      check_integrity=check_integrity,
+                                      overwrite_config=overwrite_config)
 
-        diff = self._diff_nodes
-        self._diff_nodes = None
-        t = threading.Thread(target=self._worker.run, args=(diff,), daemon=True)
+        t = threading.Thread(target=self._worker.run, daemon=True)
         t.start()
 
     def _finish(self, success: bool):
@@ -5402,16 +6390,6 @@ class OctoUpdaterApp(tk.Tk):
                     self._status_var.set("Update available!")
                     self._draw_progress(0.0)
                     self._set_btn_update()
-                elif msg == "__DIFF_TREE__":
-                    self._diff_nodes = tag
-                elif msg.startswith("__ORIGINAL_HASH__"):
-                    h = msg[len("__ORIGINAL_HASH__"):]
-                    self._cfg = update_config(
-                        lambda c: c.__setitem__("original_server_wow_hash", h))
-                elif msg.startswith("__PATCHED_HASH__"):
-                    h = msg[len("__PATCHED_HASH__"):]
-                    self._cfg = update_config(
-                        lambda c: c.__setitem__("expected_patched_wow_hash", h))
                 elif msg.startswith("__VERSION__"):
                     ver = msg[len("__VERSION__"):]
                     self._client_ver_var.set(ver)
@@ -5446,6 +6424,36 @@ class OctoUpdaterApp(tk.Tk):
 #  Entry point
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _enable_dpi_awareness():
+    """Declare DPI awareness before any Tk window is created, so Windows
+    reports the true DPI (letting us scale crisply) instead of bitmap-scaling a
+    96-DPI render. Prefers Per-Monitor-V2, falling back through older contexts.
+    Must run before the Tk root exists; a no-op off Windows / on old Windows."""
+    try:
+        import ctypes
+    except Exception:
+        return
+    user32 = getattr(ctypes, "windll", None) and ctypes.windll.user32
+    if user32 is not None:
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4, PER_MONITOR = -3.
+        for ctx in (-4, -3):
+            try:
+                if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(ctx)):
+                    return
+            except Exception:
+                pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)   # per-monitor (8.1+)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()         # system-aware (Vista+)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
+    _enable_dpi_awareness()
     app = OctoUpdaterApp()
     app.mainloop()

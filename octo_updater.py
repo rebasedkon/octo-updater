@@ -29,7 +29,7 @@ from pathlib import Path
 #  Constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-UPDATER_VERSION  = "1.3"
+UPDATER_VERSION  = "1.3.1"
 SERVER           = "https://octowow.st"
 UA               = f"OctoUpdater/{UPDATER_VERSION}"
 DOWNLOAD_RETRY   = 5
@@ -292,9 +292,14 @@ def get_client_version(out_dir: str) -> str:
             build   = f.read(4).decode("utf-8", errors="replace").rstrip("\x00")
             f.seek(0x00437c04)
             version = f.read(6).decode("utf-8", errors="replace").rstrip("\x00")
-        return f"{version} ({build})"
     except Exception:
         return ""
+    # Unexpected build, or an exe half-written mid-update, reads junk there -
+    # show nothing rather than garbage. A real read looks like version "1.12.1",
+    # build "5875".
+    if not re.fullmatch(r"\d+(?:\.\d+)+", version) or not build.isdigit():
+        return ""
+    return f"{version} ({build})"
 
 
 def fmt_size(num_bytes: float) -> str:
@@ -482,12 +487,17 @@ def _is_torrent_excluded(parts) -> bool:
     return len(parts) == 1 and parts[0].lower() in _torrent_excluded_files()
 
 
-def _torrent_skip(parts, ignore_speech: bool) -> bool:
-    """Files the sync must leave alone: mod-owned client-root files, plus
-    speech.MPQ when the user opted to keep a custom one (Settings)."""
+def _torrent_skip(parts, ignore_speech: bool, client_dir: str) -> bool:
+    """Files the sync must leave alone: mod-owned client-root files, plus a
+    speech.MPQ the user opted to keep (Settings) — but only when it already
+    exists on disk. A missing speech.MPQ is still downloaded so a clean client
+    can launch; 'ignore' protects a custom copy, it doesn't skip a required file
+    that isn't there."""
     if _is_torrent_excluded(parts):
         return True
-    return ignore_speech and bool(parts) and parts[-1].lower() == "speech.mpq"
+    if ignore_speech and parts and parts[-1].lower() == "speech.mpq":
+        return os.path.exists(os.path.join(client_dir, *parts))
+    return False
 
 
 # Files the sync must not rewrite (mod-owned client-root files, plus a kept
@@ -507,7 +517,7 @@ def shield_protected_files(client_dir: str, files, ignore_speech: bool) -> list:
     piece. Returns [(orig, backup_or_None)] for unshielding."""
     shielded = []
     for parts, _length in files:
-        if not _torrent_skip(parts, ignore_speech):
+        if not _torrent_skip(parts, ignore_speech, client_dir):
             continue
         p = os.path.join(client_dir, *parts)
         if os.path.exists(p):
@@ -560,7 +570,7 @@ def torrent_selection(client_dir: str, files, drop_mismatched=False,
     disk (aria2 --select-file), plus whether any were entirely missing."""
     need, missing = [], False
     for i, (parts, length) in enumerate(files):
-        if _torrent_skip(parts, ignore_speech):
+        if _torrent_skip(parts, ignore_speech, client_dir):
             continue
         dest = os.path.join(client_dir, *parts)
         try:
@@ -581,18 +591,18 @@ def torrent_selection(client_dir: str, files, drop_mismatched=False,
     return need, missing
 
 
-def torrent_all_selection(files, ignore_speech=False) -> list:
+def torrent_all_selection(client_dir: str, files, ignore_speech=False) -> list:
     """1-indexed list of every non-mod file in the torrent. Used for an
     integrity pass: aria2 --check-integrity verifies each selected file's piece
     hashes and re-downloads only the bad/missing pieces — catching same-size but
     corrupted files that the size-based torrent_selection can't."""
     return [i + 1 for i, (parts, _) in enumerate(files)
-            if not _torrent_skip(parts, ignore_speech)]
+            if not _torrent_skip(parts, ignore_speech, client_dir)]
 
 
 def torrent_tree_intact(client_dir: str, files, ignore_speech=False) -> bool:
     for parts, length in files:
-        if _torrent_skip(parts, ignore_speech):
+        if _torrent_skip(parts, ignore_speech, client_dir):
             continue
         try:
             if os.path.getsize(os.path.join(client_dir, *parts)) != length:
@@ -1001,8 +1011,9 @@ class UpdateWorker:
     def log(self, msg: str, tag: str = ""):
         self.log_q.put((msg, tag))
 
-    def progress(self, value: float, label: str = ""):
-        self.prog_q.put((value, label))
+    def progress(self, value: float, label: str = "", status: str | None = None):
+        # status (when given) updates the big status line; None leaves it as-is.
+        self.prog_q.put((value, label, status))
 
     def build_tweaks(self, buf, tweaks: dict | None = None):
         if tweaks is None:
@@ -1137,7 +1148,7 @@ class UpdateWorker:
                 # Full piece-hash verify + repair of every non-mod file — aria2
                 # re-hashes them and re-fetches only the bad/missing pieces.
                 need, missing = torrent_all_selection(
-                    files, ignore_speech=ignore_speech), False
+                    self.out_dir, files, ignore_speech=ignore_speech), False
             else:
                 need, missing = torrent_selection(
                     self.out_dir, files, drop_mismatched=stale,
@@ -1154,12 +1165,25 @@ class UpdateWorker:
                      if self.check_integrity
                      else f"Syncing {len(need)} file(s) via torrent…"), "acct")
 
+                # A reconcile runs two aria2 phases: it hash-checks every file
+                # (p["checking"]), then fetches the bad/missing pieces. Flip the
+                # status from "Verifying" to "Updating" between them so it doesn't
+                # read "Verifying" while files are actually being updated. Only
+                # sent on a phase change.
+                _phase = {"status": None}
+
                 def _prog(p):
                     label = f"{fmt_size(p['done'])} / {fmt_size(p['total'])}"
                     if p["bps"]:
                         label += "   •   " + fmt_speed(p["bps"])
                     frac = p["done"] / p["total"] if p["total"] else 0.0
-                    self.progress(min(frac, 1.0), label)
+                    status = None
+                    if self.check_integrity:
+                        want = ("Verifying game files…" if p["checking"]
+                                else "Updating game files…")
+                        if want != _phase["status"]:
+                            _phase["status"] = status = want
+                    self.progress(min(frac, 1.0), label, status)
 
                 # Excluded files (mod-owned + kept speech.MPQ) can still be
                 # rewritten by aria2 through a shared torrent piece. Move them
@@ -4356,8 +4380,7 @@ class OctoUpdaterApp(tk.Tk):
         import webbrowser
         webbrowser.open(url)
 
-    @staticmethod
-    def _style_mod_action_label(lbl, mod, state, live):
+    def _style_mod_action_label(self, lbl, mod, state, live):
         """Drive the per-mod action label: 'retry' (red) when the mod is in
         an error state, 'update' (gold) when a newer version is available,
         hidden otherwise. Both do the same thing — reinstall the mod."""
@@ -5171,8 +5194,7 @@ class OctoUpdaterApp(tk.Tk):
                         raise RuntimeError("Addon URL is not from an "
                                            "allowed git host")
                     sha = addon_remote_sha(rec["git"], rec.get("branch"),
-                                           rec.get("ref"), force=True,
-                                           raise_errors=True)
+                                           rec.get("ref"), raise_errors=True)
                     if not sha:
                         raise RuntimeError("Could not resolve remote commit")
                     install_addon_files(client, rec["folder"], rec["git"], sha)
@@ -6405,7 +6427,7 @@ class OctoUpdaterApp(tk.Tk):
         self._running = True
         self._set_btn_busy("Verifying…" if check_integrity else "Updating…")
         self._status_var.set("Verifying game files…" if check_integrity
-                             else "Updating…")
+                             else "Updating game files…")
         self._draw_progress(0.0)
         self._prog_label_var.set("")
 
@@ -6490,9 +6512,14 @@ class OctoUpdaterApp(tk.Tk):
         except queue.Empty:
             pass
         if latest is not None:
-            val, lbl = latest
+            val, lbl = latest[0], latest[1]
+            status = latest[2] if len(latest) > 2 else None
             self._draw_progress(val)
             self._prog_label_var.set(lbl)
+            if status:
+                self._status_var.set(status)
+                self._set_btn_busy("Verifying…" if status.startswith("Verifying")
+                                   else "Updating…")
 
         self.after(80, self._poll)
 

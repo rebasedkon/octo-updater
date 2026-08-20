@@ -4,7 +4,7 @@ A standalone desktop updater and mod manager for the **OctoWoW** client.
 It updates and patches the game client, manages community **mods**, **addons**
 and **content patches**, applies client **tweaks**, and shows server **news**.
 
-[![Octo Updater](https://github.com/rebasedkon/octo-updater/raw/main/screenshot.png)](/rebasedkon/octo-updater/blob/main/screenshot.png)
+![Octo Updater](screenshot.png)
 
 ---
 

@@ -333,7 +333,14 @@ CLIENT_TORRENT_URL = "https://dl.octowow.st/download/client.torrent"
 ARIA2_ZIP_URL    = ("https://github.com/aria2/aria2/releases/download/"
                     "release-1.37.0/aria2-1.37.0-win-32bit-build1.zip")
 ARIA2_ZIP_SHA256 = "35f6514cc5dd7e98a87b3c4c2d25a0754b9b063dbe59bc0f22d483464f61e5b6"
-ARIA2C_PATH      = os.path.join(APP_DATA_DIR, "aria2c.exe")
+
+if sys.platform == "win32":
+    ARIA2C_PATH  = os.path.join(APP_DATA_DIR, "aria2c.exe")
+else:
+    # On POSIX, resolve the system-installed binary
+    ARIA2C_PATH = shutil.which("aria2c")
+    if not ARIA2C_PATH:
+        ARIA2C_PATH = shutil.which("/home/linuxbrew/.linuxbrew/bin/aria2c")
 
 # The torrent's top-level folder name: aria2 writes files under <dir>/<name>/…,
 # so a junction <staging>/client → the real client dir lands them in place.
@@ -392,7 +399,21 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 def ensure_aria2c(log_fn=log) -> str:
     """Return the path to aria2c.exe, downloading + checksum-verifying it into
-    APP_DATA_DIR on first use. Raises on failure."""
+    APP_DATA_DIR on Windows. On POSIX, relies on the system-installed aria2c."""
+    import sys
+
+    # --- Linux / macOS path ---
+    if sys.platform != "win32":
+        if not ARIA2C_PATH:
+            raise RuntimeError(
+                "aria2c not found in PATH. Install it with "
+                "'sudo apt install aria2' on Debian/Ubuntu, "
+                "'sudo dnf install aria2' on Fedora, or "
+                "'brew install aria2' with Homebrew.")
+        log_fn("aria2c ready.", "ok")
+        return ARIA2C_PATH
+
+    # --- Windows path ---
     if os.path.exists(ARIA2C_PATH):
         return ARIA2C_PATH
     log_fn("Fetching aria2c (one-time, ~2.5 MB)…", "acct")
@@ -783,9 +804,9 @@ def read_pristine_wow(client_dir: str) -> bytes:
 
 
 def _ensure_torrent_junction(client_dir: str) -> str:
-    """Point <staging>/client at client_dir via an NTFS junction (no admin) so
-    aria2 writes the torrent's files straight into the real client dir. Returns
-    the staging dir to pass as aria2 --dir."""
+    """Point <staging>/client at client_dir via an NTFS junction (no admin) or
+    symlink (POSIX) so aria2 writes the torrent's files straight into the real
+    client dir. Returns the staging dir to pass as aria2 --dir."""
     staging = TORRENT_STAGING_DIR
     ensure_dir(staging)
     link   = os.path.join(staging, TORRENT_NAME)
@@ -796,6 +817,7 @@ def _ensure_torrent_junction(client_dir: str) -> str:
             return staging
     except OSError:
         pass
+
     # remove a stale junction/link (rmdir drops the reparse point, not its
     # target's contents) then recreate it
     try:
@@ -805,11 +827,21 @@ def _ensure_torrent_junction(client_dir: str) -> str:
             os.remove(link)
         except OSError:
             pass
-    r = subprocess.run(["cmd", "/c", "mklink", "/J", link, target],
-                       capture_output=True, text=True, creationflags=_NO_WINDOW)
-    if not os.path.isdir(link):
-        raise RuntimeError("could not create download junction: "
-                           + (r.stderr or r.stdout or "").strip())
+
+    if sys.platform == "win32":
+        # Windows: Use mklink /J for NTFS junction (requires no admin rights)
+        r = subprocess.run(["cmd", "/c", "mklink", "/J", link, target],
+                           capture_output=True, text=True, creationflags=_NO_WINDOW)
+        if not os.path.isdir(link):
+            raise RuntimeError("could not create download junction: "
+                               + (r.stderr or r.stdout or "").strip())
+    else:
+        # POSIX (Linux/macOS): Use native Python symlink mapping
+        try:
+            os.symlink(target, link, target_is_directory=True)
+        except OSError as e:
+            raise RuntimeError(f"could not create download symlink: {e}")
+
     return staging
 
 
@@ -878,6 +910,7 @@ def run_aria2c(client_dir, select_files=None, check_integrity=False,
     aria2 is handed the .torrent URL (not a local copy), so it always fetches
     the server's current torrent at download time — no chance of running a stale
     local .torrent if the user starts the update long after the verify."""
+    import sys
     global _active_aria2
     exe     = ensure_aria2c(log_fn)
     staging = _ensure_torrent_junction(client_dir)
@@ -914,9 +947,16 @@ def run_aria2c(client_dir, select_files=None, check_integrity=False,
         args.append("--select-file=" + ",".join(str(i) for i in select_files))
     args.append(CLIENT_TORRENT_URL)
 
-    proc = subprocess.Popen(args, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True,
-                            bufsize=1, creationflags=_NO_WINDOW)
+    popen_kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "bufsize": 1
+    }
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = _NO_WINDOW
+
+    proc = subprocess.Popen(args, **popen_kwargs)
     with _active_aria2_lock:
         _active_aria2 = proc
     try:
@@ -1272,7 +1312,6 @@ def write_config_wtf(client_dir: str, tweaks: dict | None = None):
         "gxWindow": 1, "gxMaximize": 1,
         "gxVSync": 0,
         "gxColorBits": 24, "gxDepthBits": 24,
-        "gxRefresh": di["refresh_rate"],
         "gxMultisampleQuality": 0, "gxMultisample": 2,
         "hwDetect": 0,
         "pixelShaders": 1, "M2UsePixelShaders": 1,
@@ -1325,6 +1364,8 @@ def write_config_wtf(client_dir: str, tweaks: dict | None = None):
         "NP_ChatBubblesBattleground": 1,
         "ChatBubblesParty": 1,
     }
+    if di.get("refresh_rate"):
+        vars_["gxRefresh"] = di["refresh_rate"]
     try:
         cfg_dir = os.path.join(client_dir, "WTF")
         ensure_dir(cfg_dir)
@@ -2667,6 +2708,24 @@ def fov_default_for_display() -> int:
 
 
 def _get_display_info_safe() -> dict:
+    if sys.platform != "win32":
+        root = tk._default_root
+        owns_root = root is None
+        try:
+            if owns_root:
+                root = tk.Tk()
+                root.withdraw()
+            width = int(root.winfo_screenwidth())
+            height = int(root.winfo_screenheight())
+            if width > 0 and height > 0:
+                return {"width": width, "height": height, "refresh_rate": None}
+        except tk.TclError:
+            pass
+        finally:
+            if owns_root and root is not None:
+                root.destroy()
+        return {"width": 1920, "height": 1080, "refresh_rate": 60}
+
     import ctypes
     ENUM_CURRENT_SETTINGS = -1
 
@@ -5922,8 +5981,9 @@ class OctoUpdaterApp(tk.Tk):
 
         _titem("✓", "Verify game files", self._settings_verify)
         _titem("☰", "Show logs", self._show_logs)
-        _titem("⛊", "Add game folder to Defender exclusions",
-               self._allow_through_antivirus)
+        if sys.platform == "win32":
+            _titem("⛊", "Add game folder to Defender exclusions",
+                   self._allow_through_antivirus)
 
         tk.Label(lcol, text="SUPPORT THE DEVELOPER",
                  font=("Segoe UI", 10, "bold"),
@@ -6017,10 +6077,10 @@ class OctoUpdaterApp(tk.Tk):
                 self._auto_addons_retrigger = False
                 self._install_missing_recommended_addons()
 
-        # Offer a Defender exclusion at each reconcile, unless the user already
-        # added one via Settings since the last reconcile. Reset after, so a
-        # later reconcile (e.g. another folder change) offers it again.
-        if needs_reconcile:
+        # Offer a Defender exclusion at each Windows reconcile, unless the user
+        # already added one via Settings since the last reconcile. Reset after,
+        # so a later reconcile (e.g. another folder change) offers it again.
+        if needs_reconcile and sys.platform == "win32":
             if not self._av_excluded:
                 self._prompt_av_exclusion()
             self._av_excluded = False
@@ -6058,6 +6118,12 @@ class OctoUpdaterApp(tk.Tk):
         client_dir = os.path.normpath(self._game_path.get().strip())
         if not client_dir or client_dir == ".":
             return
+
+        if sys.platform != "win32":
+            self._av_excluded = True
+            self._log_line("Antivirus exclusion skipped (not required on this OS).\n", "ok")
+            return
+
         import ctypes
         cmd = f"Add-MpPreference -ExclusionPath '{client_dir}'"
         r = ctypes.windll.shell32.ShellExecuteW(
@@ -6075,7 +6141,8 @@ class OctoUpdaterApp(tk.Tk):
         aria2c downloader may trigger a Windows Firewall prompt — so it doesn't
         look sketchy to a non-technical user. Purely informational; tracked in
         the config so it appears only once."""
-        if self._cfg.get("aria2_firewall_notice_shown"):
+        if (sys.platform != "win32"
+                or self._cfg.get("aria2_firewall_notice_shown")):
             return
         from tkinter import messagebox
         messagebox.showinfo(
@@ -6533,10 +6600,15 @@ def _enable_dpi_awareness():
     reports the true DPI (letting us scale crisply) instead of bitmap-scaling a
     96-DPI render. Prefers Per-Monitor-V2, falling back through older contexts.
     Must run before the Tk root exists; a no-op off Windows / on old Windows."""
+    import sys
+    if sys.platform != "win32":
+        return
+
     try:
         import ctypes
     except Exception:
         return
+
     user32 = getattr(ctypes, "windll", None) and ctypes.windll.user32
     if user32 is not None:
         # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4, PER_MONITOR = -3.

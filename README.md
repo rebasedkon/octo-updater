@@ -97,7 +97,8 @@ verification/updates.
 
 - Hardened TLS (system trust store, hostname check, TLS 1.2+ floor).
 - HTTPS-only with per-host allowlists for all downloads; redirects stay HTTPS.
-- `aria2c` itself is fetched once and SHA-256-verified before it's ever run.
+- On Windows, `aria2c` is fetched once and SHA-256-verified before it's ever
+  run. Native Linux/macOS runs use the system-installed executable.
 - Atomic config writes (temp + rename) with a lock — safe against concurrent
   workers and interrupted saves.
 - Path-traversal-safe archive extraction.
@@ -109,14 +110,23 @@ verification/updates.
 
 ## Requirements
 
-- **Windows**, or **Linux via Proton/Wine** — Octo Updater is a Windows build,
-  but it runs on Linux under Proton/Wine.
-  A couple of Windows-only conveniences (Defender exclusions, DPI-scale
-  auto-detection) simply don't apply outside Windows.
+- **Windows**, or **Linux/macOS with Wine**. On Linux, the prebuilt Windows
+  executable can also run through Proton. With Wine, run the updater and game
+  in the same prefix; with Proton, point the updater at the game folder visible
+  inside its compatibility environment.
+- Native Linux/macOS source execution supports downloading, updating, and
+  configuring client files. Its **PLAY** button does not launch the Windows
+  game executable; launch the game separately through Wine/Proton.
 - **Python 3.10+** — only if running from source. Runs on the standard
   library, and will also use [`certifi`](https://pypi.org/project/certifi/) if
   installed, for more robust TLS verification on machines with an out-of-date
   root store (otherwise falls back to the system trust store).
+- **Tkinter** — required when running from source. On Linux, install it with
+  `sudo apt install python3-tk` on Debian/Ubuntu or
+  `sudo dnf install python3-tkinter` on Fedora.
+- **aria2c** — required when running natively from source on Linux/macOS.
+  Install it with `sudo apt install aria2` on Debian/Ubuntu,
+  `sudo dnf install aria2` on Fedora, or `brew install aria2` with Homebrew.
 - The prebuilt `OctoUpdater.exe` needs nothing installed. `aria2c` is
   downloaded automatically the first time a game update runs.
 
@@ -131,13 +141,24 @@ run it. Point the **Game folder** (Settings) at your OctoWoW game folder —
 or let the default create one next to the executable — then click **UPDATE**,
 and **PLAY** when it finishes.
 
+On Linux/macOS, launch it in the Wine environment used for the game:
+
+```
+wine OctoUpdater.exe
+```
+
+On Linux with Proton, add `OctoUpdater.exe` to Steam as a non-Steam game,
+enable **Force the use of a specific Steam Play compatibility tool**, and point
+the updater at the existing game folder.
+
 ### From source
 
 ```
 python octo_updater.py
 ```
 
-The updater keeps its data in a per-user app-data folder.
+Native Linux/macOS source mode can manage the client files, but launch the game
+separately through Wine/Proton instead of using **PLAY**.
 
 ---
 
